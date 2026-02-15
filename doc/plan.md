@@ -29,11 +29,12 @@
 - UI must allow inspecting/opening local and remote versions before selecting action.
 
 5. Exclusion behavior:
-- Exclude any local path with xattr `com.dropbox.ignored = b"1"`.
+- Do not use local xattr exclusion in sync scan path (for performance on large trees).
 - Respect `.dropboxignore` files in any subfolder (gitignore-like pattern semantics).
 - Exclude folder names:
   - `CACHE_FOLDERS = {"__pycache__", ".pytest_cache", ".cache", ".ruff_cache"}`
   - `EXCLUDED_FOLDERS = {"node_modules", ".tox"} | CACHE_FOLDERS`
+- Always exclude `.DS_Store`.
 
 ## Proposed Architecture
 
@@ -64,7 +65,7 @@
   - "Open local" / "Open remote" affordances.
 
 ### 3) Transport
-- SSH for control and remote scanning.
+- SSH for control and remote scanning via streamed helper process.
 - SFTP or SCP for file transfer operations.
 - Optional future optimization: rsync-backed transfer execution while preserving planner/UI decisions.
 
@@ -81,8 +82,8 @@
 ## Comparison Strategy
 1. Scan both trees with excludes applied.
 2. Fast equality check by `(type, size, mtime_ns)` where safe.
-3. If uncertain or policy requires certainty, compute hash (`blake3` preferred, else `sha256`).
-4. Detect metadata-only drift when content hashes match.
+3. Mark uncertain cases when size matches but timestamps drift.
+4. Detect metadata-only drift when metadata differs and content appears unchanged by cheap checks.
 5. Mark delete candidates as manual on first run.
 
 ## Review UX Requirements
@@ -103,7 +104,7 @@
 ### Phase 1 - Foundation
 - Project scaffold (package layout, CLI entrypoint, config, logging).
 - Local scanner + static excludes + `.dropboxignore` parser.
-- Remote scanner (SSH helper) with normalized record format.
+- Remote scanner (SSH helper) with normalized record format and remote SQLite snapshot persistence.
 
 ### Phase 2 - Diff Engine
 - Implement compare states and metadata-only detection.

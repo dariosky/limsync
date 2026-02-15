@@ -39,8 +39,9 @@ The tool must prioritize safe reconciliation of two trees that likely diverged a
 Apply exclusions before diffing/planning.
 
 ### A) Local xattr exclusion
-Exclude any local path where:
-- `com.dropbox.ignored == b"1"`
+- Current policy: do not use `com.dropbox.ignored` xattr as a sync exclusion.
+- Reason: xattr checks were too expensive on large scans.
+- This may be reintroduced later as an optional mode.
 
 ### B) `.dropboxignore` files
 - `.dropboxignore` may exist in any subfolder.
@@ -56,6 +57,9 @@ EXCLUDED_FOLDERS = {"node_modules", ".tox"} | CACHE_FOLDERS
 ```
 
 Any path under those directories must be excluded from sync planning and apply operations.
+
+### D) Always-excluded filenames
+- `.DS_Store` is always excluded on both sides.
 
 ## Expected UX
 - Interactive TUI (preferred stack: Textual + Rich).
@@ -88,8 +92,10 @@ This is required to satisfy "identical content but metadata drift" visibility.
 - Prefer explicit review queue for destructive operations.
 
 ## Implementation Notes
-- Use a remote helper script over SSH for fast remote scans returning structured JSON.
-- Compare with cheap checks first, hash on demand when uncertain (`blake3` preferred, fallback `sha256`).
+- Use a remote helper script over SSH for fast remote scans returning structured JSONL.
+- Remote helper should persist scan metadata snapshots in a remote SQLite DB (default `~/.cache/li-sync/scan_state.sqlite3`).
+- Compare with cheap checks first.
+- Do not hash file content during initial scan phase.
 - Persist sync snapshots in SQLite for later delete/rename reasoning.
 - Record audit logs for every apply run.
 

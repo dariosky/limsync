@@ -1,1 +1,4 @@
 /.idea
+.venv
+.DS_Store
+doc/last_scan_diff.jsonl

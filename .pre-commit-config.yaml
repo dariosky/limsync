@@ -1,0 +1,19 @@
+repos:
+  - repo: local
+    hooks:
+      - id: sanitize-locks
+        name: sanitize uv.lock
+        entry: python src/li_sync/utils/sanitize_locks.py
+        language: system
+        pass_filenames: false
+        files: ^(uv\.lock|pyproject\.toml)$
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.14.10
+    hooks:
+      - id: ruff-check
+        name: backend lint
+        args: [ "--fix", "--extend-select", "I,UP" ]
+        files: ^src/
+      - id: ruff-format
+        name: backend format
+        files: ^src/
