@@ -6,7 +6,7 @@ from .models import ContentState, DiffRecord, FileRecord, MetadataState, NodeTyp
 
 
 def _format_mode(mode: int) -> str:
-    return f"0o{mode:03o}"
+    return f"0x{mode:03o}"
 
 
 def _format_mtime_ns(value: int) -> str:

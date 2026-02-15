@@ -10,7 +10,7 @@ from .text_utils import normalize_text
 
 
 @dataclass(frozen=True)
-class ScanRunSummary:
+class ScanStateSummary:
     local_root: str
     remote_address: str
     local_scan_seconds: float
@@ -25,6 +25,12 @@ class ScanRunSummary:
     metadata_only: int
 
 
+@dataclass(frozen=True)
+class StateContext:
+    local_root: str
+    remote_address: str
+
+
 def _connect(db_path: Path) -> sqlite3.Connection:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path)
@@ -34,11 +40,12 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 def _init_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
+
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS scan_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        CREATE TABLE IF NOT EXISTS state_meta (
+            singleton_id INTEGER PRIMARY KEY CHECK(singleton_id = 1),
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             local_root TEXT NOT NULL,
             remote_address TEXT NOT NULL,
             local_scan_seconds REAL NOT NULL,
@@ -54,32 +61,33 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS scan_diffs (
-            run_id INTEGER NOT NULL,
-            relpath TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS current_diffs (
+            relpath TEXT PRIMARY KEY,
             content_state TEXT NOT NULL,
             metadata_state TEXT NOT NULL,
             metadata_diff_json TEXT NOT NULL,
-            metadata_detail_json TEXT NOT NULL DEFAULT '[]',
-            PRIMARY KEY (run_id, relpath),
-            FOREIGN KEY (run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
+            metadata_detail_json TEXT NOT NULL DEFAULT '[]'
         )
         """
     )
-    cols = conn.execute("PRAGMA table_info(scan_diffs)").fetchall()
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_current_diffs_content
+        ON current_diffs(content_state, metadata_state)
+        """
+    )
+
+    cols = conn.execute("PRAGMA table_info(current_diffs)").fetchall()
     col_names = {str(col["name"]) for col in cols}
     if "metadata_detail_json" not in col_names:
         conn.execute(
-            "ALTER TABLE scan_diffs ADD COLUMN metadata_detail_json TEXT NOT NULL DEFAULT '[]'"
+            "ALTER TABLE current_diffs ADD COLUMN metadata_detail_json TEXT NOT NULL DEFAULT '[]'"
         )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_scan_diffs_run_content
-        ON scan_diffs(run_id, content_state, metadata_state)
-        """
-    )
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS ui_prefs (
@@ -88,30 +96,51 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS scan_actions (
-            run_id INTEGER NOT NULL,
-            relpath TEXT NOT NULL,
+            relpath TEXT PRIMARY KEY,
             action TEXT NOT NULL,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (run_id, relpath),
-            FOREIGN KEY (run_id) REFERENCES scan_runs(id) ON DELETE CASCADE
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
+    action_cols = conn.execute("PRAGMA table_info(scan_actions)").fetchall()
+    action_col_names = {str(col["name"]) for col in action_cols}
+    if "run_id" in action_col_names:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scan_actions_new (
+                relpath TEXT PRIMARY KEY,
+                action TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scan_actions_new(relpath, action, updated_at)
+            SELECT relpath, action, updated_at FROM scan_actions
+            """
+        )
+        conn.execute("DROP TABLE scan_actions")
+        conn.execute("ALTER TABLE scan_actions_new RENAME TO scan_actions")
 
 
-def save_scan_run(
-    db_path: Path, summary: ScanRunSummary, diffs: list[DiffRecord]
-) -> int:
+def save_current_state(
+    db_path: Path,
+    summary: ScanStateSummary,
+    diffs: list[DiffRecord],
+) -> None:
     conn = _connect(db_path)
     try:
         _init_schema(conn)
         with conn:
-            cursor = conn.execute(
+            conn.execute(
                 """
-                INSERT INTO scan_runs (
+                INSERT INTO state_meta (
+                    singleton_id,
                     local_root,
                     remote_address,
                     local_scan_seconds,
@@ -123,8 +152,23 @@ def save_scan_run(
                     only_remote,
                     different_content,
                     uncertain,
-                    metadata_only
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    metadata_only,
+                    updated_at
+                ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(singleton_id) DO UPDATE SET
+                    local_root = excluded.local_root,
+                    remote_address = excluded.remote_address,
+                    local_scan_seconds = excluded.local_scan_seconds,
+                    remote_scan_seconds = excluded.remote_scan_seconds,
+                    local_files = excluded.local_files,
+                    remote_files = excluded.remote_files,
+                    compared_paths = excluded.compared_paths,
+                    only_local = excluded.only_local,
+                    only_remote = excluded.only_remote,
+                    different_content = excluded.different_content,
+                    uncertain = excluded.uncertain,
+                    metadata_only = excluded.metadata_only,
+                    updated_at = CURRENT_TIMESTAMP
                 """,
                 (
                     normalize_text(summary.local_root),
@@ -141,21 +185,25 @@ def save_scan_run(
                     summary.metadata_only,
                 ),
             )
-            run_id = int(cursor.lastrowid)
+
+            conn.execute("CREATE TEMP TABLE _seen_paths(relpath TEXT PRIMARY KEY)")
             conn.executemany(
                 """
-                INSERT INTO scan_diffs (
-                    run_id,
+                INSERT INTO current_diffs (
                     relpath,
                     content_state,
                     metadata_state,
                     metadata_diff_json,
                     metadata_detail_json
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(relpath) DO UPDATE SET
+                    content_state = excluded.content_state,
+                    metadata_state = excluded.metadata_state,
+                    metadata_diff_json = excluded.metadata_diff_json,
+                    metadata_detail_json = excluded.metadata_detail_json
                 """,
                 [
                     (
-                        run_id,
                         normalize_text(diff.relpath),
                         diff.content_state.value,
                         diff.metadata_state.value,
@@ -165,94 +213,48 @@ def save_scan_run(
                     for diff in diffs
                 ],
             )
-        return run_id
+            conn.executemany(
+                "INSERT OR IGNORE INTO _seen_paths(relpath) VALUES (?)",
+                ((normalize_text(diff.relpath),) for diff in diffs),
+            )
+            conn.execute(
+                "DELETE FROM current_diffs WHERE relpath NOT IN (SELECT relpath FROM _seen_paths)"
+            )
+            conn.execute(
+                "DELETE FROM scan_actions WHERE relpath NOT IN (SELECT relpath FROM _seen_paths)"
+            )
+            conn.execute("DROP TABLE _seen_paths")
     finally:
         conn.close()
 
 
-def get_latest_run_id(db_path: Path) -> int | None:
+def get_state_context(db_path: Path) -> StateContext | None:
     conn = _connect(db_path)
     try:
         _init_schema(conn)
         row = conn.execute(
-            "SELECT id FROM scan_runs ORDER BY id DESC LIMIT 1"
+            "SELECT local_root, remote_address FROM state_meta WHERE singleton_id = 1"
         ).fetchone()
-        return int(row["id"]) if row else None
+        if row is None:
+            return None
+        return StateContext(
+            local_root=str(row["local_root"]),
+            remote_address=str(row["remote_address"]),
+        )
     finally:
         conn.close()
 
 
-def query_diffs(
-    db_path: Path,
-    run_id: int,
-    content: str,
-    metadata_only: bool,
-    offset: int,
-    limit: int,
-) -> tuple[int, list[dict[str, object]]]:
-    conn = _connect(db_path)
-    try:
-        _init_schema(conn)
-        where = ["run_id = ?"]
-        params: list[object] = [run_id]
-
-        if content != "all":
-            where.append("content_state = ?")
-            params.append(content)
-
-        if metadata_only:
-            where.append("content_state = 'identical' AND metadata_state = 'different'")
-
-        clause = " AND ".join(where)
-
-        total_row = conn.execute(
-            f"SELECT COUNT(*) AS c FROM scan_diffs WHERE {clause}",
-            params,
-        ).fetchone()
-        total = int(total_row["c"] if total_row else 0)
-
-        rows = conn.execute(
-            f"""
-            SELECT relpath, content_state, metadata_state, metadata_diff_json
-            FROM scan_diffs
-            WHERE {clause}
-            ORDER BY relpath
-            LIMIT ? OFFSET ?
-            """,
-            [*params, limit, offset],
-        ).fetchall()
-
-        data = [
-            {
-                "relpath": row["relpath"],
-                "content_state": row["content_state"],
-                "metadata_state": row["metadata_state"],
-                "metadata_diff": json.loads(row["metadata_diff_json"]),
-                "metadata_details": [],
-            }
-            for row in rows
-        ]
-        return total, data
-    finally:
-        conn.close()
-
-
-def load_run_diffs(
-    db_path: Path,
-    run_id: int,
-) -> list[dict[str, object]]:
+def load_current_diffs(db_path: Path) -> list[dict[str, object]]:
     conn = _connect(db_path)
     try:
         _init_schema(conn)
         rows = conn.execute(
             """
-            SELECT relpath, content_state, metadata_state, metadata_diff_json
-                 , metadata_detail_json
-            FROM scan_diffs
-            WHERE run_id = ?
+            SELECT relpath, content_state, metadata_state, metadata_diff_json, metadata_detail_json
+            FROM current_diffs
             ORDER BY relpath
-            """,
-            (run_id,),
+            """
         ).fetchall()
         return [
             {
@@ -299,28 +301,17 @@ def set_ui_pref(db_path: Path, key: str, value: str) -> None:
         conn.close()
 
 
-def load_action_overrides(db_path: Path, run_id: int) -> dict[str, str]:
+def load_action_overrides(db_path: Path) -> dict[str, str]:
     conn = _connect(db_path)
     try:
         _init_schema(conn)
-        rows = conn.execute(
-            """
-            SELECT relpath, action
-            FROM scan_actions
-            WHERE run_id = ?
-            """,
-            (run_id,),
-        ).fetchall()
+        rows = conn.execute("SELECT relpath, action FROM scan_actions").fetchall()
         return {str(row["relpath"]): str(row["action"]) for row in rows}
     finally:
         conn.close()
 
 
-def upsert_action_overrides(
-    db_path: Path,
-    run_id: int,
-    updates: dict[str, str],
-) -> None:
+def upsert_action_overrides(db_path: Path, updates: dict[str, str]) -> None:
     if not updates:
         return
     conn = _connect(db_path)
@@ -329,16 +320,39 @@ def upsert_action_overrides(
         with conn:
             conn.executemany(
                 """
-                INSERT INTO scan_actions (run_id, relpath, action)
-                VALUES (?, ?, ?)
-                ON CONFLICT(run_id, relpath) DO UPDATE SET
+                INSERT INTO scan_actions (relpath, action)
+                VALUES (?, ?)
+                ON CONFLICT(relpath) DO UPDATE SET
                     action = excluded.action,
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
-                    (run_id, normalize_text(relpath), action)
+                    (normalize_text(relpath), action)
                     for relpath, action in updates.items()
                 ),
+            )
+    finally:
+        conn.close()
+
+
+def mark_paths_identical(db_path: Path, relpaths: set[str]) -> None:
+    if not relpaths:
+        return
+    conn = _connect(db_path)
+    try:
+        _init_schema(conn)
+        with conn:
+            conn.executemany(
+                """
+                UPDATE current_diffs
+                SET
+                    content_state = 'identical',
+                    metadata_state = 'identical',
+                    metadata_diff_json = '[]',
+                    metadata_detail_json = '[]'
+                WHERE relpath = ?
+                """,
+                ((normalize_text(relpath),) for relpath in relpaths),
             )
     finally:
         conn.close()

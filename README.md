@@ -1,9 +1,8 @@
-# li-sync
+![Li-Sync](logo.png)
 
-Initial implementation of an interactive Dropbox-like bidirectional sync tool over SSH.
+An interactive Dropbox-like bidirectional sync tool over SSH for devs.
 
 ## Current status
-- Phase 1 foundation in place.
 - Local scanner with support for:
   - nested `.dropboxignore`
   - excluded folders (`node_modules`, `.tox`, cache dirs)
@@ -16,6 +15,11 @@ Initial implementation of an interactive Dropbox-like bidirectional sync tool ov
   - metadata status (mode + mtime)
 - scan progress with adaptive path depth for long-running scans
 - Always excludes `.DS_Store`, excluded folder families, and `.li-sync`.
+- Also excludes `.venv` and Finder `Icon\\r` marker files.
+- Interactive review TUI with:
+  - tree navigation
+  - per-file/per-folder action assignment
+  - in-TUI plan apply with confirmation + progress + errors
 
 ## Install dependencies
 
@@ -43,20 +47,36 @@ uv run li-sync scan \
 # Scan without opening the review UI immediately
 uv run li-sync scan --no-open-review
 
-# Review from local SQLite state (latest run)
+# Review from local SQLite state
 uv run li-sync review \
-  --local-root /Users/dario.varotto/Dropbox \
-  --run-id 12
+  --local-root /Users/dario.varotto/Dropbox
 ```
 
 ## Review UI keys
 - Arrow keys: navigate tree
-- Right: expand folder
-- Left: collapse folder
+- Enter: open/close selected folder
 - `h`: show/hide completely identical folders (preference persisted in SQLite)
+- `l`: left wins (applies to selected file/subtree)
+- `r`: right wins (applies to selected file/subtree)
+- `i`: ignore (applies to selected file/subtree)
+- `s`: suggested planner action (applies to selected file/subtree)
+- `a`: apply current plan (press twice to confirm)
 - `q`: quit
 
+## Planner behavior
+- Default action is `ignore` (do nothing) until you assign actions.
+- Plan summary shows operation counts:
+  - delete left/right
+  - copy left/right
+  - metadata updates left/right
+- `a` is disabled when total planned operations is zero.
+- Applying opens:
+  - confirmation modal (`A` apply / `C` cancel)
+  - execution modal with progress bar and error list
+- After apply:
+  - successful paths are marked done in-place during execution (no rescan)
+  - failed paths stay pending in the UI
+
 ## Notes
-- `review` and `apply` commands are placeholders for upcoming phases.
+- There is no standalone CLI `apply` command; apply is executed from the review TUI.
 - xattr-based exclusion is intentionally disabled in current scan path for performance.
-- First-run destructive actions (deletes) are intentionally not implemented yet.

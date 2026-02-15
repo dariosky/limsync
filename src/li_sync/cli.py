@@ -24,10 +24,10 @@ from .review_tui import run_review_tui
 from .scanner_local import LocalScanner
 from .scanner_remote import RemoteScanner
 from .state_db import (
-    ScanRunSummary,
-    get_latest_run_id,
+    ScanStateSummary,
+    get_state_context,
     get_ui_pref,
-    save_scan_run,
+    save_current_state,
 )
 
 app = typer.Typer(help="Interactive Dropbox-like sync tooling over SSH")
@@ -216,7 +216,7 @@ def scan(
             and diff.metadata_state == MetadataState.DIFFERENT
         ):
             metadata_only += 1
-    run_summary = ScanRunSummary(
+    run_summary = ScanStateSummary(
         local_root=str(local_root),
         remote_address=remote_cfg.address,
         local_scan_seconds=local_elapsed,
@@ -230,7 +230,7 @@ def scan(
         uncertain=counts[ContentState.UNKNOWN],
         metadata_only=metadata_only,
     )
-    run_id = save_scan_run(local_db_path, run_summary, diffs)
+    save_current_state(local_db_path, run_summary, diffs)
 
     console.print()
     console.print(f"Local files: {len(local_records)}")
@@ -241,16 +241,13 @@ def scan(
     console.print(f"Different content: {counts[ContentState.DIFFERENT]}")
     console.print(f"Uncertain (same size, mtime drift): {counts[ContentState.UNKNOWN]}")
     console.print(f"Metadata-only drift: {metadata_only}")
-    console.print(f"Local state DB: {local_db_path}")
-    console.print(f"Remote state DB: {remote_db_path}")
-    console.print(f"Recorded run id: {run_id}")
     if open_review:
         pref_value = get_ui_pref(local_db_path, "review.hide_identical", "1")
         resolved_hide_identical = pref_value != "0"
         run_review_tui(
             db_path=local_db_path,
-            run_id=run_id,
             local_root=local_root,
+            remote_address=remote_cfg.address,
             hide_identical=resolved_hide_identical,
         )
     else:
@@ -269,16 +266,12 @@ def review(
         None,
         help="Path to local SQLite status DB (default: <local_root>/.li-sync/state.sqlite3)",
     ),
-    run_id: int | None = typer.Option(
-        None,
-        help="Run ID to review (default: latest)",
-    ),
     hide_identical: bool | None = typer.Option(
         None,
         help="Hide folders that are completely identical (default: persisted preference)",
     ),
 ) -> None:
-    """Open interactive tree review UI for a recorded scan run."""
+    """Open interactive tree review UI for the current saved scan state."""
     resolved_local_root = local_root.expanduser().resolve()
     resolved_db = (
         db_path.expanduser().resolve()
@@ -289,9 +282,9 @@ def review(
         console.print(f"[red]State DB not found:[/red] {resolved_db}")
         raise typer.Exit(1)
 
-    resolved_run_id = run_id if run_id is not None else get_latest_run_id(resolved_db)
-    if resolved_run_id is None:
-        console.print("No scan runs recorded yet.")
+    context = get_state_context(resolved_db)
+    if context is None:
+        console.print("No scan state recorded yet. Run `li-sync scan` first.")
         raise typer.Exit(1)
 
     if hide_identical is None:
@@ -302,17 +295,9 @@ def review(
 
     run_review_tui(
         db_path=resolved_db,
-        run_id=resolved_run_id,
         local_root=resolved_local_root,
+        remote_address=context.remote_address,
         hide_identical=resolved_hide_identical,
-    )
-
-
-@app.command()
-def apply() -> None:
-    """Placeholder for upcoming apply engine."""
-    console.print(
-        "Apply engine is planned for Phase 3 (manual-delete-safe by default)."
     )
 
 

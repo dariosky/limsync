@@ -1,0 +1,313 @@
+from __future__ import annotations
+
+import os
+import stat
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+
+import paramiko
+
+from .models import ContentState, DiffRecord, MetadataState
+
+ACTION_LEFT_WINS = "left_wins"
+ACTION_RIGHT_WINS = "right_wins"
+ACTION_IGNORE = "ignore"
+ACTION_SUGGESTED = "suggested"
+
+
+@dataclass(frozen=True)
+class PlanOperation:
+    kind: str
+    relpath: str
+
+
+@dataclass(frozen=True)
+class PlanSummary:
+    delete_left: int = 0
+    delete_right: int = 0
+    copy_left: int = 0
+    copy_right: int = 0
+    metadata_update_left: int = 0
+    metadata_update_right: int = 0
+
+    @property
+    def total(self) -> int:
+        return (
+            self.delete_left
+            + self.delete_right
+            + self.copy_left
+            + self.copy_right
+            + self.metadata_update_left
+            + self.metadata_update_right
+        )
+
+
+@dataclass(frozen=True)
+class ExecuteResult:
+    completed_paths: set[str]
+    errors: list[str]
+    succeeded_operations: int
+    total_operations: int
+
+
+def parse_remote_address(remote_address: str) -> tuple[str, str, str]:
+    # format: user@host:/abs/or/tilde/path
+    if "@" not in remote_address or ":" not in remote_address:
+        raise ValueError(f"Invalid remote address: {remote_address}")
+    user_host, root = remote_address.split(":", 1)
+    user, host = user_host.split("@", 1)
+    return user, host, root
+
+
+def _metadata_ops(relpath: str, action: str, diff: DiffRecord) -> list[PlanOperation]:
+    if diff.metadata_state != MetadataState.DIFFERENT:
+        return []
+    if action == ACTION_LEFT_WINS:
+        return [PlanOperation("metadata_update_right", relpath)]
+    if action == ACTION_RIGHT_WINS:
+        return [PlanOperation("metadata_update_left", relpath)]
+    if action == ACTION_SUGGESTED:
+        return [
+            PlanOperation("metadata_update_left", relpath),
+            PlanOperation("metadata_update_right", relpath),
+        ]
+    return []
+
+
+def build_plan_operations(
+    diffs: list[DiffRecord],
+    action_overrides: dict[str, str],
+) -> list[PlanOperation]:
+    ops: list[PlanOperation] = []
+    for diff in diffs:
+        action = action_overrides.get(diff.relpath, ACTION_IGNORE)
+        if action == ACTION_IGNORE:
+            continue
+
+        if diff.content_state == ContentState.ONLY_LOCAL:
+            if action in {ACTION_LEFT_WINS, ACTION_SUGGESTED}:
+                ops.append(PlanOperation("copy_right", diff.relpath))
+            elif action == ACTION_RIGHT_WINS:
+                ops.append(PlanOperation("delete_left", diff.relpath))
+            continue
+
+        if diff.content_state == ContentState.ONLY_REMOTE:
+            if action in {ACTION_RIGHT_WINS, ACTION_SUGGESTED}:
+                ops.append(PlanOperation("copy_left", diff.relpath))
+            elif action == ACTION_LEFT_WINS:
+                ops.append(PlanOperation("delete_right", diff.relpath))
+            continue
+
+        if diff.content_state in {ContentState.DIFFERENT, ContentState.UNKNOWN}:
+            if action == ACTION_LEFT_WINS:
+                ops.append(PlanOperation("copy_right", diff.relpath))
+            elif action == ACTION_RIGHT_WINS:
+                ops.append(PlanOperation("copy_left", diff.relpath))
+            # suggested => no content op for conflict/unknown
+
+        ops.extend(_metadata_ops(diff.relpath, action, diff))
+
+    # dedupe by (kind, path)
+    dedup = {(op.kind, op.relpath): op for op in ops}
+    return list(dedup.values())
+
+
+def summarize_operations(ops: list[PlanOperation]) -> PlanSummary:
+    counts = {
+        "delete_left": 0,
+        "delete_right": 0,
+        "copy_left": 0,
+        "copy_right": 0,
+        "metadata_update_left": 0,
+        "metadata_update_right": 0,
+    }
+    for op in ops:
+        if op.kind in counts:
+            counts[op.kind] += 1
+    return PlanSummary(**counts)
+
+
+def _ensure_local_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def _ensure_remote_parent(sftp: paramiko.SFTPClient, remote_path: str) -> None:
+    parent = os.path.dirname(remote_path)
+    if not parent:
+        return
+    parts = []
+    while parent and parent != "/":
+        parts.append(parent)
+        parent = os.path.dirname(parent)
+    for segment in reversed(parts):
+        try:
+            sftp.stat(segment)
+        except OSError:
+            sftp.mkdir(segment)
+
+
+def _join_remote(root: str, relpath: str) -> str:
+    return f"{root.rstrip('/')}/{relpath}"
+
+
+def _remote_expand_root(client: paramiko.SSHClient, root: str) -> str:
+    quoted = root.replace("'", "'\\''")
+    command = f"python3 -c \"import os; print(os.path.expanduser('{quoted}'))\""
+    _stdin, stdout, stderr = client.exec_command(command)
+    out = stdout.read().decode("utf-8", errors="replace").strip()
+    err = stderr.read().decode("utf-8", errors="replace").strip()
+    if out:
+        return out
+    raise RuntimeError(f"Failed to resolve remote root {root!r}: {err}")
+
+
+def execute_plan(
+    local_root: Path,
+    remote_address: str,
+    operations: list[PlanOperation],
+    progress_cb: Callable[[int, int, PlanOperation, bool, str | None], None]
+    | None = None,
+) -> ExecuteResult:
+    if not operations:
+        return ExecuteResult(
+            completed_paths=set(),
+            errors=[],
+            succeeded_operations=0,
+            total_operations=0,
+        )
+
+    user, host, remote_root_raw = parse_remote_address(remote_address)
+    path_ops: dict[str, list[PlanOperation]] = {}
+    for op in operations:
+        path_ops.setdefault(op.relpath, []).append(op)
+
+    client = paramiko.SSHClient()
+    client.load_system_host_keys()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname=host,
+        username=user,
+        port=22,
+        look_for_keys=True,
+        allow_agent=True,
+        timeout=10,
+    )
+
+    errors: list[str] = []
+    succeeded: set[tuple[str, str]] = set()
+    attempted: set[tuple[str, str]] = set()
+    done_count = 0
+    total = len(operations)
+
+    try:
+        remote_root = _remote_expand_root(client, remote_root_raw)
+        sftp = client.open_sftp()
+        try:
+            for op in operations:
+                attempted.add((op.kind, op.relpath))
+                relpath = op.relpath
+                local_path = local_root / relpath
+                remote_path = _join_remote(remote_root, relpath)
+                ok = False
+                error: str | None = None
+
+                try:
+                    if op.kind == "copy_right":
+                        if not local_path.exists():
+                            raise FileNotFoundError(
+                                f"missing local source: {local_path}"
+                            )
+                        _ensure_remote_parent(sftp, remote_path)
+                        sftp.put(str(local_path), remote_path)
+                        ok = True
+                    elif op.kind == "copy_left":
+                        sftp.stat(remote_path)
+                        _ensure_local_parent(local_path)
+                        sftp.get(remote_path, str(local_path))
+                        ok = True
+                    elif op.kind == "delete_right":
+                        sftp.remove(remote_path)
+                        ok = True
+                    elif op.kind == "delete_left":
+                        local_path.unlink()
+                        ok = True
+                    elif op.kind in {"metadata_update_left", "metadata_update_right"}:
+                        lst = local_path.lstat()
+                        rst = sftp.stat(remote_path)
+                        op_kinds = {item.kind for item in path_ops.get(relpath, [])}
+                        has_left = "metadata_update_left" in op_kinds
+                        has_right = "metadata_update_right" in op_kinds
+
+                        target_mode = (
+                            min(stat.S_IMODE(lst.st_mode), stat.S_IMODE(rst.st_mode))
+                            if (has_left and has_right)
+                            else None
+                        )
+                        target_mtime_ns = (
+                            min(lst.st_mtime_ns, int(rst.st_mtime * 1_000_000_000))
+                            if (has_left and has_right)
+                            else None
+                        )
+
+                        if op.kind == "metadata_update_left":
+                            mode = (
+                                target_mode
+                                if target_mode is not None
+                                else stat.S_IMODE(rst.st_mode)
+                            )
+                            mtime_ns = (
+                                target_mtime_ns
+                                if target_mtime_ns is not None
+                                else int(rst.st_mtime * 1_000_000_000)
+                            )
+                            os.chmod(local_path, mode)
+                            os.utime(local_path, ns=(lst.st_atime_ns, mtime_ns))
+                            ok = True
+                        else:
+                            mode = (
+                                target_mode
+                                if target_mode is not None
+                                else stat.S_IMODE(lst.st_mode)
+                            )
+                            mtime_ns = (
+                                target_mtime_ns
+                                if target_mtime_ns is not None
+                                else lst.st_mtime_ns
+                            )
+                            sftp.chmod(remote_path, mode)
+                            sftp.utime(
+                                remote_path,
+                                (int(rst.st_atime), int(mtime_ns / 1_000_000_000)),
+                            )
+                            ok = True
+                    else:
+                        error = f"unsupported operation kind: {op.kind}"
+                except Exception as exc:  # noqa: BLE001
+                    error = str(exc)
+
+                if ok:
+                    succeeded.add((op.kind, op.relpath))
+                elif error:
+                    errors.append(f"{op.kind} {op.relpath}: {error}")
+
+                done_count += 1
+                if progress_cb is not None:
+                    progress_cb(done_count, total, op, ok, error)
+
+        finally:
+            sftp.close()
+    finally:
+        client.close()
+
+    completed_paths: set[str] = set()
+    for relpath, path_operations in path_ops.items():
+        if all((op.kind, op.relpath) in succeeded for op in path_operations):
+            completed_paths.add(relpath)
+
+    return ExecuteResult(
+        completed_paths=completed_paths,
+        errors=errors,
+        succeeded_operations=len(succeeded),
+        total_operations=total,
+    )

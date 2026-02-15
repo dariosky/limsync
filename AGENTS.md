@@ -14,6 +14,7 @@ The tool must prioritize safe reconciliation of two trees that likely diverged a
 - Architecture: core sync engine + interactive terminal UI.
 - Primary interaction mode: review first, apply second.
 - Transport: SSH-based remote operations.
+- State model: single current workspace state (no run-history workflow).
 
 ## Core Requirements
 1. Distinguish content differences from metadata differences.
@@ -53,13 +54,14 @@ Use exactly:
 
 ```python
 CACHE_FOLDERS = {"__pycache__", ".pytest_cache", ".cache", ".ruff_cache"}
-EXCLUDED_FOLDERS = {"node_modules", ".tox", ".li-sync"} | CACHE_FOLDERS
+EXCLUDED_FOLDERS = {"node_modules", ".tox", ".venv", ".li-sync"} | CACHE_FOLDERS
 ```
 
 Any path under those directories must be excluded from sync planning and apply operations.
 
 ### D) Always-excluded filenames
 - `.DS_Store` is always excluded on both sides.
+- `Icon\\r` (Finder custom-icon marker files) is always excluded on both sides.
 
 ## Expected UX
 - Interactive TUI (preferred stack: Textual + Rich).
@@ -70,11 +72,10 @@ Any path under those directories must be excluded from sync planning and apply o
 - Hide completely identical folders by default, with persisted UI preference in local SQLite.
 
 ## CLI Surface (Target)
-- `sync scan`
-- `sync review`
-- `sync apply`
-- `sync run --dry-run`
+- `li-sync scan`
+- `li-sync review`
 
+Apply is intentionally executed inside the review TUI (`a`) with explicit confirmation.
 Avoid irreversible behavior in default commands.
 
 ## Data Modeling Guidance
@@ -98,8 +99,8 @@ This is required to satisfy "identical content but metadata drift" visibility.
 - Persist remote scan status in `<remote_root>/.li-sync/state.sqlite3`.
 - Compare with cheap checks first.
 - Do not hash file content during initial scan phase.
-- Persist sync snapshots in SQLite for later delete/rename reasoning.
-- Record audit logs for every apply run.
+- Persist one current diff/worktree state in SQLite and preserve user action overrides when paths remain applicable.
+- During apply, update UI state incrementally as operations complete; do not trigger a full rescan.
 
 ## Testing Priorities
 1. Exclusion correctness (`xattr`, nested `.dropboxignore`, excluded dirs).
