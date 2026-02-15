@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import unicodedata
+
 
 def normalize_text(value: str) -> str:
     """Return UTF-8 safe text by collapsing surrogate-escaped bytes.
@@ -7,5 +9,7 @@ def normalize_text(value: str) -> str:
     Filesystem paths may contain undecodable bytes represented as lone surrogates.
     SQLite text binding and terminal rendering reject those, so normalize them to
     replacement characters while keeping valid UTF-8 data untouched.
+    Also canonicalize to NFC so macOS/Linux path forms match for unicode names.
     """
-    return value.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    safe = value.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+    return unicodedata.normalize("NFC", safe)

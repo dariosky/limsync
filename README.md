@@ -40,13 +40,21 @@ uv run li-sync scan \
   --remote-host 192.168.18.18 \
   --remote-root '~/Dropbox'
 
+# Scan without opening the review UI immediately
+uv run li-sync scan --no-open-review
+
 # Review from local SQLite state (latest run)
 uv run li-sync review \
   --local-root /Users/dario.varotto/Dropbox \
-  --content only_remote \
-  --offset 0 \
-  --limit 100
+  --run-id 12
 ```
+
+## Review UI keys
+- Arrow keys: navigate tree
+- Right: expand folder
+- Left: collapse folder
+- `h`: show/hide completely identical folders (preference persisted in SQLite)
+- `q`: quit
 
 ## Notes
 - `review` and `apply` commands are placeholders for upcoming phases.

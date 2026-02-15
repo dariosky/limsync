@@ -67,6 +67,7 @@ Any path under those directories must be excluded from sync planning and apply o
 - Fast filtering: conflicts, metadata-only changes, only-local, only-remote, delete candidates.
 - Per-item and per-subtree action assignment.
 - Dry-run first; explicit confirmation before apply.
+- Hide completely identical folders by default, with persisted UI preference in local SQLite.
 
 ## CLI Surface (Target)
 - `sync scan`

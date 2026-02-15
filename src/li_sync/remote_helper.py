@@ -11,8 +11,8 @@ import time
 from pathlib import PurePosixPath
 
 CACHE_FOLDERS = {"__pycache__", ".pytest_cache", ".cache", ".ruff_cache"}
-EXCLUDED_FOLDERS = {"node_modules", ".tox", ".li-sync"} | CACHE_FOLDERS
-EXCLUDED_FILE_NAMES = {".DS_Store"}
+EXCLUDED_FOLDERS = {"node_modules", ".tox", ".venv", ".li-sync"} | CACHE_FOLDERS
+EXCLUDED_FILE_NAMES = {".DS_Store", "Icon\r"}
 
 
 def emit(event: dict[str, object]) -> None:

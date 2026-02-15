@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CACHE_FOLDERS = {"__pycache__", ".pytest_cache", ".cache", ".ruff_cache"}
-EXCLUDED_FOLDERS = {"node_modules", ".tox", ".li-sync"} | CACHE_FOLDERS
-EXCLUDED_FILE_NAMES = {".DS_Store"}
+EXCLUDED_FOLDERS = {"node_modules", ".tox", ".venv", ".li-sync"} | CACHE_FOLDERS
+EXCLUDED_FILE_NAMES = {".DS_Store", "Icon\r"}
 
 DEFAULT_LOCAL_ROOT = Path("/Users/dario.varotto/Dropbox")
 DEFAULT_REMOTE_HOST = "192.168.18.18"

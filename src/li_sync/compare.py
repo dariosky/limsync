@@ -1,17 +1,35 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 from .models import ContentState, DiffRecord, FileRecord, MetadataState, NodeType
+
+
+def _format_mode(mode: int) -> str:
+    return f"0o{mode:03o}"
+
+
+def _format_mtime_ns(value: int) -> str:
+    dt = datetime.fromtimestamp(value / 1_000_000_000, tz=UTC)
+    return dt.strftime("%Y-%m-%d %H:%M:%S.%f UTC")
 
 
 def _same_metadata(
     local: FileRecord, remote: FileRecord, mtime_tolerance_ns: int
-) -> tuple[bool, tuple[str, ...]]:
+) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
     diff: list[str] = []
+    details: list[str] = []
     if local.mode != remote.mode:
         diff.append("mode")
+        details.append(
+            f"mode: local={_format_mode(local.mode)} remote={_format_mode(remote.mode)}"
+        )
     if abs(local.mtime_ns - remote.mtime_ns) > mtime_tolerance_ns:
         diff.append("mtime")
-    return (len(diff) == 0, tuple(diff))
+        details.append(
+            f"mtime: local={_format_mtime_ns(local.mtime_ns)} remote={_format_mtime_ns(remote.mtime_ns)}"
+        )
+    return (len(diff) == 0, tuple(diff), tuple(details))
 
 
 def compare_records(
@@ -33,6 +51,7 @@ def compare_records(
                     content_state=ContentState.ONLY_LOCAL,
                     metadata_state=MetadataState.NOT_APPLICABLE,
                     metadata_diff=(),
+                    metadata_details=(),
                 )
             )
             continue
@@ -44,6 +63,7 @@ def compare_records(
                     content_state=ContentState.ONLY_REMOTE,
                     metadata_state=MetadataState.NOT_APPLICABLE,
                     metadata_diff=(),
+                    metadata_details=(),
                 )
             )
             continue
@@ -57,11 +77,16 @@ def compare_records(
                     content_state=ContentState.DIFFERENT,
                     metadata_state=MetadataState.DIFFERENT,
                     metadata_diff=("type",),
+                    metadata_details=(
+                        f"type: {local.node_type.value} -> {remote.node_type.value}",
+                    ),
                 )
             )
             continue
 
-        same_metadata, metadata_diff = _same_metadata(local, remote, mtime_tolerance_ns)
+        same_metadata, metadata_diff, metadata_details = _same_metadata(
+            local, remote, mtime_tolerance_ns
+        )
 
         if local.node_type != NodeType.FILE:
             diffs.append(
@@ -72,6 +97,7 @@ def compare_records(
                     if same_metadata
                     else MetadataState.DIFFERENT,
                     metadata_diff=metadata_diff,
+                    metadata_details=metadata_details,
                 )
             )
             continue
@@ -96,6 +122,7 @@ def compare_records(
                 if same_metadata
                 else MetadataState.DIFFERENT,
                 metadata_diff=metadata_diff,
+                metadata_details=metadata_details,
             )
         )
 

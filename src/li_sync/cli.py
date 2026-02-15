@@ -8,7 +8,6 @@ from pathlib import Path, PurePosixPath
 import typer
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
-from rich.table import Table
 
 from .compare import compare_records
 from .config import (
@@ -21,9 +20,15 @@ from .config import (
     RemoteConfig,
 )
 from .models import ContentState, FileRecord, MetadataState
+from .review_tui import run_review_tui
 from .scanner_local import LocalScanner
 from .scanner_remote import RemoteScanner
-from .state_db import ScanRunSummary, get_latest_run_id, query_diffs, save_scan_run
+from .state_db import (
+    ScanRunSummary,
+    get_latest_run_id,
+    get_ui_pref,
+    save_scan_run,
+)
 
 app = typer.Typer(help="Interactive Dropbox-like sync tooling over SSH")
 console = Console()
@@ -101,9 +106,12 @@ def scan(
         None,
         help="Remote SQLite path for scan status (default: <remote_root>/.li-sync/state.sqlite3)",
     ),
-    show: int = typer.Option(40, min=1, help="How many diff rows to print"),
+    open_review: bool = typer.Option(
+        True,
+        help="Open interactive review UI after scan",
+    ),
 ) -> None:
-    """Scan local and remote trees and print a first diff report."""
+    """Scan local and remote trees, store run status, and open review UI."""
     local_root = local_root.expanduser().resolve()
     local_db_path = (
         local_state_db.expanduser().resolve()
@@ -225,8 +233,6 @@ def scan(
     run_id = save_scan_run(local_db_path, run_summary, diffs)
 
     console.print()
-    console.print(f"Local scan time: {_format_seconds(local_elapsed)}")
-    console.print(f"Remote scan time: {_format_seconds(remote_elapsed)}")
     console.print(f"Local files: {len(local_records)}")
     console.print(f"Remote files: {len(remote_records)}")
     console.print(f"Compared paths: {len(diffs)}")
@@ -238,42 +244,19 @@ def scan(
     console.print(f"Local state DB: {local_db_path}")
     console.print(f"Remote state DB: {remote_db_path}")
     console.print(f"Recorded run id: {run_id}")
-
-    table = Table(title=f"Top {min(show, len(diffs))} changes")
-    table.add_column("Path", overflow="fold")
-    table.add_column("Content")
-    table.add_column("Metadata")
-    table.add_column("Metadata Diff")
-
-    displayed = 0
-    for diff in diffs:
-        if (
-            diff.content_state == ContentState.IDENTICAL
-            and diff.metadata_state == MetadataState.IDENTICAL
-        ):
-            continue
-        table.add_row(
-            diff.relpath,
-            diff.content_state.value,
-            diff.metadata_state.value,
-            ", ".join(diff.metadata_diff) if diff.metadata_diff else "-",
+    if open_review:
+        pref_value = get_ui_pref(local_db_path, "review.hide_identical", "1")
+        resolved_hide_identical = pref_value != "0"
+        run_review_tui(
+            db_path=local_db_path,
+            run_id=run_id,
+            local_root=local_root,
+            hide_identical=resolved_hide_identical,
         )
-        displayed += 1
-        if displayed >= show:
-            break
-
-    if displayed == 0:
-        console.print("\nNo differences detected.")
-        return
-
-    if len(diffs) > displayed:
-        console.print(f"\nShowing first {displayed} changes out of {len(diffs)} total.")
+    else:
         console.print(
-            f"Use `li-sync review --db-path {local_db_path} --run-id {run_id}` for full browsing."
+            "Run `li-sync review` to inspect changes in the interactive tree UI."
         )
-
-    console.print()
-    console.print(table)
 
 
 @app.command()
@@ -290,18 +273,12 @@ def review(
         None,
         help="Run ID to review (default: latest)",
     ),
-    content: str = typer.Option(
-        "all",
-        help="Filter content state: all/only_local/only_remote/different/unknown/identical",
+    hide_identical: bool | None = typer.Option(
+        None,
+        help="Hide folders that are completely identical (default: persisted preference)",
     ),
-    metadata_only: bool = typer.Option(
-        False,
-        help="Show only metadata-only drift entries",
-    ),
-    offset: int = typer.Option(0, min=0, help="Start offset in filtered results"),
-    limit: int = typer.Option(80, min=1, help="Max rows to show"),
 ) -> None:
-    """Review previously scanned differences from SQLite (non-TUI phase)."""
+    """Open interactive tree review UI for a recorded scan run."""
     resolved_local_root = local_root.expanduser().resolve()
     resolved_db = (
         db_path.expanduser().resolve()
@@ -312,53 +289,23 @@ def review(
         console.print(f"[red]State DB not found:[/red] {resolved_db}")
         raise typer.Exit(1)
 
-    allowed = {"all", "only_local", "only_remote", "different", "unknown", "identical"}
-    if content not in allowed:
-        console.print(f"[red]Invalid --content:[/red] {content}")
-        console.print(f"Allowed values: {', '.join(sorted(allowed))}")
-        raise typer.Exit(1)
-
     resolved_run_id = run_id if run_id is not None else get_latest_run_id(resolved_db)
     if resolved_run_id is None:
         console.print("No scan runs recorded yet.")
         raise typer.Exit(1)
 
-    total, page = query_diffs(
+    if hide_identical is None:
+        pref_value = get_ui_pref(resolved_db, "review.hide_identical", "1")
+        resolved_hide_identical = pref_value != "0"
+    else:
+        resolved_hide_identical = hide_identical
+
+    run_review_tui(
         db_path=resolved_db,
         run_id=resolved_run_id,
-        content=content,
-        metadata_only=metadata_only,
-        offset=offset,
-        limit=limit,
+        local_root=resolved_local_root,
+        hide_identical=resolved_hide_identical,
     )
-
-    if total == 0:
-        console.print("No matching records.")
-        return
-
-    start = min(offset, total)
-    end = min(start + limit, total)
-
-    table = Table(
-        title=f"Review run {resolved_run_id}: {start}-{end} of {total} filtered records"
-    )
-    table.add_column("Path", overflow="fold")
-    table.add_column("Content")
-    table.add_column("Metadata")
-    table.add_column("Metadata Diff")
-    for row in page:
-        table.add_row(
-            str(row.get("relpath", "")),
-            str(row.get("content_state", "")),
-            str(row.get("metadata_state", "")),
-            ", ".join(row.get("metadata_diff", []))
-            if row.get("metadata_diff")
-            else "-",
-        )
-
-    console.print(table)
-    if end < total:
-        console.print(f"More rows available. Next page offset: {end}")
 
 
 @app.command()
