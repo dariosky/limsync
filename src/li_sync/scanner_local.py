@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 
 from .excludes import IgnoreRules, is_excluded_file_name, is_excluded_folder_name
 from .models import FileRecord, NodeType
+from .text_utils import normalize_text
 
 
 def _node_type(st_mode: int) -> NodeType:
@@ -81,7 +82,7 @@ class LocalScanner:
                     continue
                 files_seen += 1
 
-                relpath = child_rel.as_posix()
+                relpath = normalize_text(child_rel.as_posix())
                 records[relpath] = FileRecord(
                     relpath=relpath,
                     node_type=node_type,

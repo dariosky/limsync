@@ -33,7 +33,7 @@
 - Respect `.dropboxignore` files in any subfolder (gitignore-like pattern semantics).
 - Exclude folder names:
   - `CACHE_FOLDERS = {"__pycache__", ".pytest_cache", ".cache", ".ruff_cache"}`
-  - `EXCLUDED_FOLDERS = {"node_modules", ".tox"} | CACHE_FOLDERS`
+  - `EXCLUDED_FOLDERS = {"node_modules", ".tox", ".li-sync"} | CACHE_FOLDERS`
 - Always exclude `.DS_Store`.
 
 ## Proposed Architecture
@@ -68,6 +68,10 @@
 - SSH for control and remote scanning via streamed helper process.
 - SFTP or SCP for file transfer operations.
 - Optional future optimization: rsync-backed transfer execution while preserving planner/UI decisions.
+
+### 4) State Persistence
+- Store local scan/diff status in `<local_root>/.li-sync/state.sqlite3`.
+- Store remote scan snapshot status in `<remote_root>/.li-sync/state.sqlite3`.
 
 ## Data Model (High-level)
 - For each path:

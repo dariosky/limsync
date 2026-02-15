@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import json
 import threading
 import time
 from pathlib import Path, PurePosixPath
@@ -17,13 +16,14 @@ from .config import (
     DEFAULT_REMOTE_HOST,
     DEFAULT_REMOTE_PORT,
     DEFAULT_REMOTE_ROOT,
-    DEFAULT_REMOTE_STATE_DB,
     DEFAULT_REMOTE_USER,
+    DEFAULT_STATE_SUBPATH,
     RemoteConfig,
 )
 from .models import ContentState, FileRecord, MetadataState
 from .scanner_local import LocalScanner
 from .scanner_remote import RemoteScanner
+from .state_db import ScanRunSummary, get_latest_run_id, query_diffs, save_scan_run
 
 app = typer.Typer(help="Interactive Dropbox-like sync tooling over SSH")
 console = Console()
@@ -78,22 +78,12 @@ def _format_seconds(seconds: float) -> str:
     return f"{seconds:.2f}s"
 
 
-def _write_diff_jsonl(path: Path, diffs: list[object]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        for diff in diffs:
-            handle.write(
-                json.dumps(
-                    {
-                        "relpath": diff.relpath,
-                        "content_state": diff.content_state.value,
-                        "metadata_state": diff.metadata_state.value,
-                        "metadata_diff": list(diff.metadata_diff),
-                    },
-                    ensure_ascii=True,
-                )
-                + "\n"
-            )
+def _local_state_db_path(local_root: Path) -> Path:
+    return local_root / Path(DEFAULT_STATE_SUBPATH)
+
+
+def _remote_state_db_path(remote_root: str) -> str:
+    return f"{remote_root.rstrip('/')}/{DEFAULT_STATE_SUBPATH}"
 
 
 @app.command()
@@ -103,24 +93,30 @@ def scan(
     remote_user: str = typer.Option(DEFAULT_REMOTE_USER, help="Remote SSH user"),
     remote_port: int = typer.Option(DEFAULT_REMOTE_PORT, help="Remote SSH port"),
     remote_root: str = typer.Option(DEFAULT_REMOTE_ROOT, help="Remote root folder"),
-    remote_state_db: str = typer.Option(
-        DEFAULT_REMOTE_STATE_DB,
-        help="Remote SQLite cache path used by helper",
+    local_state_db: Path | None = typer.Option(
+        None,
+        help="Local SQLite path for scan status (default: <local_root>/.li-sync/state.sqlite3)",
     ),
-    save_diff: Path = typer.Option(
-        Path("doc/last_scan_diff.jsonl"),
-        help="Write full diff set as JSONL to this file",
+    remote_state_db: str | None = typer.Option(
+        None,
+        help="Remote SQLite path for scan status (default: <remote_root>/.li-sync/state.sqlite3)",
     ),
     show: int = typer.Option(40, min=1, help="How many diff rows to print"),
 ) -> None:
     """Scan local and remote trees and print a first diff report."""
     local_root = local_root.expanduser().resolve()
+    local_db_path = (
+        local_state_db.expanduser().resolve()
+        if local_state_db is not None
+        else _local_state_db_path(local_root)
+    )
+    remote_db_path = remote_state_db or _remote_state_db_path(remote_root)
     remote_cfg = RemoteConfig(
         host=remote_host,
         user=remote_user,
         port=remote_port,
         root=remote_root,
-        state_db=remote_state_db,
+        state_db=remote_db_path,
     )
 
     with Progress(
@@ -195,7 +191,6 @@ def scan(
             )
 
     diffs = compare_records(local_records, remote_records)
-    _write_diff_jsonl(save_diff, diffs)
 
     counts = {
         ContentState.ONLY_LOCAL: 0,
@@ -213,6 +208,21 @@ def scan(
             and diff.metadata_state == MetadataState.DIFFERENT
         ):
             metadata_only += 1
+    run_summary = ScanRunSummary(
+        local_root=str(local_root),
+        remote_address=remote_cfg.address,
+        local_scan_seconds=local_elapsed,
+        remote_scan_seconds=remote_elapsed,
+        local_files=len(local_records),
+        remote_files=len(remote_records),
+        compared_paths=len(diffs),
+        only_local=counts[ContentState.ONLY_LOCAL],
+        only_remote=counts[ContentState.ONLY_REMOTE],
+        different_content=counts[ContentState.DIFFERENT],
+        uncertain=counts[ContentState.UNKNOWN],
+        metadata_only=metadata_only,
+    )
+    run_id = save_scan_run(local_db_path, run_summary, diffs)
 
     console.print()
     console.print(f"Local scan time: {_format_seconds(local_elapsed)}")
@@ -225,7 +235,9 @@ def scan(
     console.print(f"Different content: {counts[ContentState.DIFFERENT]}")
     console.print(f"Uncertain (same size, mtime drift): {counts[ContentState.UNKNOWN]}")
     console.print(f"Metadata-only drift: {metadata_only}")
-    console.print(f"Saved full diff: {save_diff}")
+    console.print(f"Local state DB: {local_db_path}")
+    console.print(f"Remote state DB: {remote_db_path}")
+    console.print(f"Recorded run id: {run_id}")
 
     table = Table(title=f"Top {min(show, len(diffs))} changes")
     table.add_column("Path", overflow="fold")
@@ -256,7 +268,9 @@ def scan(
 
     if len(diffs) > displayed:
         console.print(f"\nShowing first {displayed} changes out of {len(diffs)} total.")
-        console.print(f"Use `li-sync review --diff-file {save_diff}` for the full set.")
+        console.print(
+            f"Use `li-sync review --db-path {local_db_path} --run-id {run_id}` for full browsing."
+        )
 
     console.print()
     console.print(table)
@@ -264,9 +278,17 @@ def scan(
 
 @app.command()
 def review(
-    diff_file: Path = typer.Option(
-        Path("doc/last_scan_diff.jsonl"),
-        help="Path to JSONL diff file generated by `scan`",
+    local_root: Path = typer.Option(
+        DEFAULT_LOCAL_ROOT,
+        help="Local root folder; used for default DB location",
+    ),
+    db_path: Path | None = typer.Option(
+        None,
+        help="Path to local SQLite status DB (default: <local_root>/.li-sync/state.sqlite3)",
+    ),
+    run_id: int | None = typer.Option(
+        None,
+        help="Run ID to review (default: latest)",
     ),
     content: str = typer.Option(
         "all",
@@ -279,9 +301,15 @@ def review(
     offset: int = typer.Option(0, min=0, help="Start offset in filtered results"),
     limit: int = typer.Option(80, min=1, help="Max rows to show"),
 ) -> None:
-    """Review previously scanned differences from JSONL (non-TUI phase)."""
-    if not diff_file.exists():
-        console.print(f"[red]Diff file not found:[/red] {diff_file}")
+    """Review previously scanned differences from SQLite (non-TUI phase)."""
+    resolved_local_root = local_root.expanduser().resolve()
+    resolved_db = (
+        db_path.expanduser().resolve()
+        if db_path is not None
+        else _local_state_db_path(resolved_local_root)
+    )
+    if not resolved_db.exists():
+        console.print(f"[red]State DB not found:[/red] {resolved_db}")
         raise typer.Exit(1)
 
     allowed = {"all", "only_local", "only_remote", "different", "unknown", "identical"}
@@ -290,33 +318,30 @@ def review(
         console.print(f"Allowed values: {', '.join(sorted(allowed))}")
         raise typer.Exit(1)
 
-    rows: list[dict[str, object]] = []
-    with diff_file.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
-                continue
-            rows.append(json.loads(line))
+    resolved_run_id = run_id if run_id is not None else get_latest_run_id(resolved_db)
+    if resolved_run_id is None:
+        console.print("No scan runs recorded yet.")
+        raise typer.Exit(1)
 
-    filtered: list[dict[str, object]] = []
-    for row in rows:
-        c_state = str(row.get("content_state", ""))
-        m_state = str(row.get("metadata_state", ""))
-        if content != "all" and c_state != content:
-            continue
-        if metadata_only and not (c_state == "identical" and m_state == "different"):
-            continue
-        filtered.append(row)
+    total, page = query_diffs(
+        db_path=resolved_db,
+        run_id=resolved_run_id,
+        content=content,
+        metadata_only=metadata_only,
+        offset=offset,
+        limit=limit,
+    )
 
-    if not filtered:
+    if total == 0:
         console.print("No matching records.")
         return
 
-    start = min(offset, len(filtered))
-    end = min(start + limit, len(filtered))
-    page = filtered[start:end]
+    start = min(offset, total)
+    end = min(start + limit, total)
 
-    table = Table(title=f"Review {start}-{end} of {len(filtered)} filtered records")
+    table = Table(
+        title=f"Review run {resolved_run_id}: {start}-{end} of {total} filtered records"
+    )
     table.add_column("Path", overflow="fold")
     table.add_column("Content")
     table.add_column("Metadata")
@@ -332,7 +357,7 @@ def review(
         )
 
     console.print(table)
-    if end < len(filtered):
+    if end < total:
         console.print(f"More rows available. Next page offset: {end}")
 
 

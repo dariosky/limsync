@@ -9,6 +9,7 @@ import paramiko
 
 from .config import RemoteConfig
 from .models import FileRecord, NodeType
+from .text_utils import normalize_text
 
 
 class RemoteScanner:
@@ -70,7 +71,7 @@ class RemoteScanner:
                     continue
 
                 if kind == "record":
-                    relpath = str(event["relpath"])
+                    relpath = normalize_text(str(event["relpath"]))
                     node_type = NodeType(str(event.get("node_type", "file")))
                     records[relpath] = FileRecord(
                         relpath=relpath,

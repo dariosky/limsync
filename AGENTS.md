@@ -53,7 +53,7 @@ Use exactly:
 
 ```python
 CACHE_FOLDERS = {"__pycache__", ".pytest_cache", ".cache", ".ruff_cache"}
-EXCLUDED_FOLDERS = {"node_modules", ".tox"} | CACHE_FOLDERS
+EXCLUDED_FOLDERS = {"node_modules", ".tox", ".li-sync"} | CACHE_FOLDERS
 ```
 
 Any path under those directories must be excluded from sync planning and apply operations.
@@ -93,7 +93,8 @@ This is required to satisfy "identical content but metadata drift" visibility.
 
 ## Implementation Notes
 - Use a remote helper script over SSH for fast remote scans returning structured JSONL.
-- Remote helper should persist scan metadata snapshots in a remote SQLite DB (default `~/.cache/li-sync/scan_state.sqlite3`).
+- Persist local scan status in `<local_root>/.li-sync/state.sqlite3`.
+- Persist remote scan status in `<remote_root>/.li-sync/state.sqlite3`.
 - Compare with cheap checks first.
 - Do not hash file content during initial scan phase.
 - Persist sync snapshots in SQLite for later delete/rename reasoning.

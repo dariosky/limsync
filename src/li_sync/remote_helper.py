@@ -11,7 +11,7 @@ import time
 from pathlib import PurePosixPath
 
 CACHE_FOLDERS = {"__pycache__", ".pytest_cache", ".cache", ".ruff_cache"}
-EXCLUDED_FOLDERS = {"node_modules", ".tox"} | CACHE_FOLDERS
+EXCLUDED_FOLDERS = {"node_modules", ".tox", ".li-sync"} | CACHE_FOLDERS
 EXCLUDED_FILE_NAMES = {".DS_Store"}
 
 
@@ -135,9 +135,18 @@ def node_type(st_mode: int) -> str:
 
 
 def update_state_db(
-    state_db: str, root: str, records: list[tuple[str, str, int, int, int]]
+    state_db: str,
+    root: str,
+    records: list[tuple[str, str, int, int, int]],
+    dirs_scanned: int,
+    files_seen: int,
 ) -> None:
-    db_path = os.path.expanduser(state_db)
+    expanded_state_db = os.path.expanduser(state_db)
+    db_path = (
+        expanded_state_db
+        if os.path.isabs(expanded_state_db)
+        else os.path.join(root, expanded_state_db)
+    )
     db_dir = os.path.dirname(db_path)
     if db_dir:
         os.makedirs(db_dir, exist_ok=True)
@@ -197,6 +206,17 @@ def update_state_db(
                 (root,),
             )
             conn.execute("DROP TABLE seen")
+            conn.execute(
+                """
+                INSERT INTO scan_meta (root, scanned_at, dirs_scanned, files_seen)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(root) DO UPDATE SET
+                    scanned_at = excluded.scanned_at,
+                    dirs_scanned = excluded.dirs_scanned,
+                    files_seen = excluded.files_seen
+                """,
+                (root, now, dirs_scanned, files_seen),
+            )
     finally:
         conn.close()
 
@@ -312,7 +332,7 @@ def run_scan(root_arg: str, state_db: str, progress_interval: float) -> int:
             )
 
     try:
-        update_state_db(state_db, root, records_for_db)
+        update_state_db(state_db, root, records_for_db, dirs_scanned, files_seen)
     except Exception as exc:
         emit({"event": "error", "message": f"state_db_update_failed: {exc}"})
         errors += 1
@@ -334,7 +354,7 @@ def run_scan(root_arg: str, state_db: str, progress_interval: float) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Remote helper for li-sync")
     parser.add_argument("--root", required=True)
-    parser.add_argument("--state-db", default="~/.cache/li-sync/scan_state.sqlite3")
+    parser.add_argument("--state-db", default=".li-sync/state.sqlite3")
     parser.add_argument("--progress-interval", type=float, default=0.25)
     return parser.parse_args()
 

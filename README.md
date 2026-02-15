@@ -8,12 +8,14 @@ Initial implementation of an interactive Dropbox-like bidirectional sync tool ov
   - nested `.dropboxignore`
   - excluded folders (`node_modules`, `.tox`, cache dirs)
 - Remote scanner over SSH helper (streamed JSONL) with nested `.dropboxignore` + excluded folders.
-- Remote helper persists scan snapshot metadata in SQLite (`~/.cache/li-sync/scan_state.sqlite3` by default).
+- Local and remote scan status are persisted in SQLite under each sync root:
+  - `<local_root>/.li-sync/state.sqlite3`
+  - `<remote_root>/.li-sync/state.sqlite3`
 - First comparison report that separates:
   - content status
   - metadata status (mode + mtime)
-  - scan progress with adaptive path depth for long-running scans
-- Always excludes `.DS_Store` and excluded folder families.
+- scan progress with adaptive path depth for long-running scans
+- Always excludes `.DS_Store`, excluded folder families, and `.li-sync`.
 
 ## Install dependencies
 
@@ -36,12 +38,11 @@ uv run li-sync scan \
   --local-root /Users/dario.varotto/Dropbox \
   --remote-user dario \
   --remote-host 192.168.18.18 \
-  --remote-root '~/Dropbox' \
-  --remote-state-db '~/.cache/li-sync/scan_state.sqlite3'
+  --remote-root '~/Dropbox'
 
-# Review the full saved diff set (not only top N)
+# Review from local SQLite state (latest run)
 uv run li-sync review \
-  --diff-file doc/last_scan_diff.jsonl \
+  --local-root /Users/dario.varotto/Dropbox \
   --content only_remote \
   --offset 0 \
   --limit 100

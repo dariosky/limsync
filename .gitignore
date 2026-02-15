@@ -1,4 +1,7 @@
 /.idea
 .venv
+__pycache__/
+
 .DS_Store
-doc/last_scan_diff.jsonl
+
+.li-sync/
