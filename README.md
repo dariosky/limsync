@@ -55,7 +55,7 @@ uv run li-sync review \
 ## Review UI keys
 - Arrow keys: navigate tree
 - Enter: open/close selected folder
-- `?`: show advanced Commands modal (`Up/Down` to select, `Enter` to execute)
+- `?`: show advanced Commands modal (`Up/Down` to select, `Enter` to execute), including clear plan and metadata-suggestion bulk apply
 - `h`: show/hide completely identical folders (preference persisted in SQLite)
 - `D`: diff selected file (local vs downloaded remote) in a modal
 - `l`: left wins (applies to selected file/subtree)

@@ -398,3 +398,13 @@ def delete_paths_from_current_state(db_path: Path, relpaths: set[str]) -> None:
             )
     finally:
         conn.close()
+
+
+def clear_action_overrides(db_path: Path) -> None:
+    conn = _connect(db_path)
+    try:
+        _init_schema(conn)
+        with conn:
+            conn.execute("DELETE FROM scan_actions")
+    finally:
+        conn.close()

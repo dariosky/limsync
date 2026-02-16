@@ -33,6 +33,7 @@ from .planner_apply import (
     summarize_operations,
 )
 from .state_db import (
+    clear_action_overrides,
     delete_paths_from_current_state,
     load_action_overrides,
     load_current_diffs,
@@ -676,6 +677,9 @@ class CommandsModal(ModalScreen[str | None]):
         ("o", "open_selected"),
         ("D", "diff_selected"),
         ("I", "add_to_dropboxignore"),
+        ("C", "clear_plan"),
+        ("M", "apply_all_metadata_suggestions"),
+        ("P", "view_plan"),
     ]
 
     def __init__(self) -> None:
@@ -689,6 +693,9 @@ class CommandsModal(ModalScreen[str | None]):
             "o": "open",
             "D": "diff",
             "I": "add ignore rule",
+            "C": "clear plan",
+            "M": "add all meta suggestions",
+            "P": "view plan",
         }
         for idx, (key, _action) in enumerate(self.COMMANDS):
             pointer = ">" if idx == self.selected_index else " "
@@ -832,6 +839,9 @@ class ReviewApp(App[None]):
         Binding("enter", "toggle_cursor_node", "Open/Close"),
         Binding("o", "open_selected", "Open", show=False),
         Binding("D", "diff_selected", "Diff", show=False),
+        Binding("P", "view_plan", "View Plan", show=False),
+        Binding("C", "clear_plan", "Clear Plan", show=False),
+        Binding("M", "apply_all_metadata_suggestions", "Meta Suggestions", show=False),
         Binding("l", "apply_left_wins", "Left Wins"),
         Binding("r", "apply_right_wins", "Right Wins"),
         Binding("i", "apply_ignore", "Ignore"),
@@ -1017,6 +1027,14 @@ class ReviewApp(App[None]):
                 Binding("enter", "toggle_cursor_node", "Open/Close"),
                 Binding("o", "open_selected", "Open", show=False),
                 Binding("D", "diff_selected", "Diff", show=False),
+                Binding("P", "view_plan", "View Plan", show=False),
+                Binding("C", "clear_plan", "Clear Plan", show=False),
+                Binding(
+                    "M",
+                    "apply_all_metadata_suggestions",
+                    "Meta Suggestions",
+                    show=False,
+                ),
                 Binding("l", "apply_left_wins", "Left Wins"),
                 Binding("r", "apply_right_wins", "Right Wins"),
                 Binding("i", "apply_ignore", "Ignore"),
@@ -1649,6 +1667,58 @@ class ReviewApp(App[None]):
 
     def action_apply_suggested(self) -> None:
         self._apply_action(ACTION_SUGGESTED)
+
+    def _refresh_after_plan_change(self) -> None:
+        self._rebuild_tree()
+        self._update_plan_panel()
+        selected = self._current_selection()
+        if selected is None:
+            self._set_info_for_dir(self.root)
+            return
+        kind, relpath = selected
+        if kind == "file" and relpath in self.files_by_relpath:
+            self._set_info_for_file(self.files_by_relpath[relpath])
+        elif kind == "dir" and relpath in self.dirs_by_relpath:
+            self._set_info_for_dir(self.dirs_by_relpath[relpath])
+        else:
+            self._set_info_for_dir(self.root)
+
+    def action_clear_plan(self) -> None:
+        if not self.action_overrides:
+            self.status_message = "Plan already clear."
+            self._update_plan_panel()
+            return
+        clear_action_overrides(self.db_path)
+        self.action_overrides = {}
+        self.status_message = "Plan cleared: all actions reset to ignore."
+        self._refresh_after_plan_change()
+
+    def action_apply_all_metadata_suggestions(self) -> None:
+        updates: dict[str, str] = {}
+        for relpath, entry in self.files_by_relpath.items():
+            if entry.metadata_state != "different":
+                continue
+            suggested_ops = self._operations_for_entry(relpath, ACTION_SUGGESTED)
+            if not suggested_ops:
+                continue
+            if not all(
+                op_kind in {"metadata_update_left", "metadata_update_right"}
+                for op_kind in suggested_ops
+            ):
+                continue
+            updates[relpath] = ACTION_SUGGESTED
+        if not updates:
+            self.status_message = "No metadata-only suggestions available."
+            self._update_plan_panel()
+            return
+
+        self.action_overrides.update(updates)
+        upsert_action_overrides(self.db_path, updates)
+        self.status_message = (
+            f"Applied metadata suggestions to {len(updates)} file"
+            f"{'' if len(updates) == 1 else 's'}."
+        )
+        self._refresh_after_plan_change()
 
     def _on_command_chosen(self, action_name: str | None) -> None:
         if action_name is None:
