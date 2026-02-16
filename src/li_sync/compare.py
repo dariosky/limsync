@@ -32,6 +32,16 @@ def _same_metadata(
     return (len(diff) == 0, tuple(diff), tuple(details))
 
 
+def _preferred_metadata_source(
+    local: FileRecord, remote: FileRecord, metadata_diff: tuple[str, ...]
+) -> str | None:
+    if "mode" in metadata_diff and local.mode != remote.mode:
+        return "local" if local.mode < remote.mode else "remote"
+    if "mtime" in metadata_diff and local.mtime_ns != remote.mtime_ns:
+        return "local" if local.mtime_ns < remote.mtime_ns else "remote"
+    return None
+
+
 def compare_records(
     local_records: dict[str, FileRecord],
     remote_records: dict[str, FileRecord],
@@ -52,6 +62,7 @@ def compare_records(
                     metadata_state=MetadataState.NOT_APPLICABLE,
                     metadata_diff=(),
                     metadata_details=(),
+                    metadata_source=None,
                 )
             )
             continue
@@ -64,6 +75,7 @@ def compare_records(
                     metadata_state=MetadataState.NOT_APPLICABLE,
                     metadata_diff=(),
                     metadata_details=(),
+                    metadata_source=None,
                 )
             )
             continue
@@ -80,6 +92,7 @@ def compare_records(
                     metadata_details=(
                         f"type: {local.node_type.value} -> {remote.node_type.value}",
                     ),
+                    metadata_source=None,
                 )
             )
             continue
@@ -87,6 +100,7 @@ def compare_records(
         same_metadata, metadata_diff, metadata_details = _same_metadata(
             local, remote, mtime_tolerance_ns
         )
+        metadata_source = _preferred_metadata_source(local, remote, metadata_diff)
 
         if local.node_type != NodeType.FILE:
             diffs.append(
@@ -98,6 +112,7 @@ def compare_records(
                     else MetadataState.DIFFERENT,
                     metadata_diff=metadata_diff,
                     metadata_details=metadata_details,
+                    metadata_source=metadata_source,
                 )
             )
             continue
@@ -123,6 +138,7 @@ def compare_records(
                 else MetadataState.DIFFERENT,
                 metadata_diff=metadata_diff,
                 metadata_details=metadata_details,
+                metadata_source=metadata_source,
             )
         )
 

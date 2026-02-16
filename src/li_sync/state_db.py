@@ -69,7 +69,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             content_state TEXT NOT NULL,
             metadata_state TEXT NOT NULL,
             metadata_diff_json TEXT NOT NULL,
-            metadata_detail_json TEXT NOT NULL DEFAULT '[]'
+            metadata_detail_json TEXT NOT NULL DEFAULT '[]',
+            metadata_source TEXT
         )
         """
     )
@@ -87,6 +88,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE current_diffs ADD COLUMN metadata_detail_json TEXT NOT NULL DEFAULT '[]'"
         )
+    if "metadata_source" not in col_names:
+        conn.execute("ALTER TABLE current_diffs ADD COLUMN metadata_source TEXT")
 
     conn.execute(
         """
@@ -194,13 +197,15 @@ def save_current_state(
                     content_state,
                     metadata_state,
                     metadata_diff_json,
-                    metadata_detail_json
-                ) VALUES (?, ?, ?, ?, ?)
+                    metadata_detail_json,
+                    metadata_source
+                ) VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(relpath) DO UPDATE SET
                     content_state = excluded.content_state,
                     metadata_state = excluded.metadata_state,
                     metadata_diff_json = excluded.metadata_diff_json,
-                    metadata_detail_json = excluded.metadata_detail_json
+                    metadata_detail_json = excluded.metadata_detail_json,
+                    metadata_source = excluded.metadata_source
                 """,
                 [
                     (
@@ -209,6 +214,9 @@ def save_current_state(
                         diff.metadata_state.value,
                         json.dumps(list(diff.metadata_diff), ensure_ascii=True),
                         json.dumps(list(diff.metadata_details), ensure_ascii=True),
+                        normalize_text(diff.metadata_source)
+                        if diff.metadata_source is not None
+                        else None,
                     )
                     for diff in diffs
                 ],
@@ -251,7 +259,7 @@ def load_current_diffs(db_path: Path) -> list[dict[str, object]]:
         _init_schema(conn)
         rows = conn.execute(
             """
-            SELECT relpath, content_state, metadata_state, metadata_diff_json, metadata_detail_json
+            SELECT relpath, content_state, metadata_state, metadata_diff_json, metadata_detail_json, metadata_source
             FROM current_diffs
             ORDER BY relpath
             """
@@ -263,6 +271,7 @@ def load_current_diffs(db_path: Path) -> list[dict[str, object]]:
                 "metadata_state": row["metadata_state"],
                 "metadata_diff": json.loads(row["metadata_diff_json"]),
                 "metadata_details": json.loads(row["metadata_detail_json"] or "[]"),
+                "metadata_source": row["metadata_source"],
             }
             for row in rows
         ]

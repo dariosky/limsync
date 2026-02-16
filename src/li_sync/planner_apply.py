@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import paramiko
@@ -60,6 +62,42 @@ def parse_remote_address(remote_address: str) -> tuple[str, str, str]:
     return user, host, root
 
 
+def _infer_metadata_source_from_details(diff: DiffRecord) -> str | None:
+    mode_re = re.compile(r"mode:\s+local=0x([0-7]{3})\s+remote=0x([0-7]{3})")
+    mtime_re = re.compile(r"mtime:\s+local=(.*?)\s+remote=(.*?)$")
+
+    for detail in diff.metadata_details:
+        mode_match = mode_re.match(detail)
+        if mode_match:
+            local_mode = int(mode_match.group(1), 8)
+            remote_mode = int(mode_match.group(2), 8)
+            if local_mode != remote_mode:
+                return "local" if local_mode < remote_mode else "remote"
+
+    for detail in diff.metadata_details:
+        mtime_match = mtime_re.match(detail)
+        if mtime_match:
+            local_mtime = datetime.strptime(
+                mtime_match.group(1), "%Y-%m-%d %H:%M:%S.%f UTC"
+            )
+            remote_mtime = datetime.strptime(
+                mtime_match.group(2), "%Y-%m-%d %H:%M:%S.%f UTC"
+            )
+            if local_mtime != remote_mtime:
+                return "local" if local_mtime < remote_mtime else "remote"
+
+    return None
+
+
+def _suggested_metadata_op(relpath: str, diff: DiffRecord) -> list[PlanOperation]:
+    source = diff.metadata_source or _infer_metadata_source_from_details(diff)
+    if source == "local":
+        return [PlanOperation("metadata_update_right", relpath)]
+    if source == "remote":
+        return [PlanOperation("metadata_update_left", relpath)]
+    return []
+
+
 def _metadata_ops(relpath: str, action: str, diff: DiffRecord) -> list[PlanOperation]:
     if diff.metadata_state != MetadataState.DIFFERENT:
         return []
@@ -68,10 +106,7 @@ def _metadata_ops(relpath: str, action: str, diff: DiffRecord) -> list[PlanOpera
     if action == ACTION_RIGHT_WINS:
         return [PlanOperation("metadata_update_left", relpath)]
     if action == ACTION_SUGGESTED:
-        return [
-            PlanOperation("metadata_update_left", relpath),
-            PlanOperation("metadata_update_right", relpath),
-        ]
+        return _suggested_metadata_op(relpath, diff)
     return []
 
 
@@ -151,6 +186,43 @@ def _join_remote(root: str, relpath: str) -> str:
     return f"{root.rstrip('/')}/{relpath}"
 
 
+def _remote_mtime_ns(st: object) -> int:
+    return int(float(getattr(st, "st_mtime", 0)) * 1_000_000_000)
+
+
+def _remote_atime_ns(st: object) -> int:
+    return int(float(getattr(st, "st_atime", 0)) * 1_000_000_000)
+
+
+def _apply_remote_metadata_from_local(
+    sftp: paramiko.SFTPClient,
+    remote_path: str,
+    local_stat: os.stat_result,
+) -> None:
+    mode = stat.S_IMODE(local_stat.st_mode)
+    sftp.chmod(remote_path, mode)
+    # SFTP exposes second-level utime; ns precision is not available.
+    sftp.utime(
+        remote_path,
+        (
+            int(local_stat.st_atime_ns / 1_000_000_000),
+            int(local_stat.st_mtime_ns / 1_000_000_000),
+        ),
+    )
+
+
+def _apply_local_metadata_from_remote(
+    local_path: Path,
+    remote_stat: object,
+) -> None:
+    mode = stat.S_IMODE(getattr(remote_stat, "st_mode", 0))
+    os.chmod(local_path, mode)
+    os.utime(
+        local_path,
+        ns=(_remote_atime_ns(remote_stat), _remote_mtime_ns(remote_stat)),
+    )
+
+
 def _remote_expand_root(client: paramiko.SSHClient, root: str) -> str:
     quoted = root.replace("'", "'\\''")
     command = f"python3 -c \"import os; print(os.path.expanduser('{quoted}'))\""
@@ -218,13 +290,20 @@ def execute_plan(
                             raise FileNotFoundError(
                                 f"missing local source: {local_path}"
                             )
+                        source_local_stat = local_path.lstat()
                         _ensure_remote_parent(sftp, remote_path)
                         sftp.put(str(local_path), remote_path)
+                        _apply_remote_metadata_from_local(
+                            sftp, remote_path, source_local_stat
+                        )
                         ok = True
                     elif op.kind == "copy_left":
-                        sftp.stat(remote_path)
+                        source_remote_stat = sftp.stat(remote_path)
                         _ensure_local_parent(local_path)
                         sftp.get(remote_path, str(local_path))
+                        _apply_local_metadata_from_remote(
+                            local_path, source_remote_stat
+                        )
                         ok = True
                     elif op.kind == "delete_right":
                         sftp.remove(remote_path)
@@ -245,7 +324,7 @@ def execute_plan(
                             else None
                         )
                         target_mtime_ns = (
-                            min(lst.st_mtime_ns, int(rst.st_mtime * 1_000_000_000))
+                            min(lst.st_mtime_ns, _remote_mtime_ns(rst))
                             if (has_left and has_right)
                             else None
                         )
@@ -259,7 +338,7 @@ def execute_plan(
                             mtime_ns = (
                                 target_mtime_ns
                                 if target_mtime_ns is not None
-                                else int(rst.st_mtime * 1_000_000_000)
+                                else _remote_mtime_ns(rst)
                             )
                             os.chmod(local_path, mode)
                             os.utime(local_path, ns=(lst.st_atime_ns, mtime_ns))

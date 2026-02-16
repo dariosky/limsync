@@ -42,3 +42,4 @@ class DiffRecord:
     metadata_state: MetadataState
     metadata_diff: tuple[str, ...]
     metadata_details: tuple[str, ...] = ()
+    metadata_source: str | None = None

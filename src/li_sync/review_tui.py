@@ -1,14 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import platform
+import re
+import subprocess
+import tempfile
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
+import paramiko
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import BindingsMap
-from textual.containers import Center, Horizontal, Vertical
+from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Footer, Header, ProgressBar, Static, Tree
 
@@ -22,6 +28,7 @@ from .planner_apply import (
     PlanOperation,
     build_plan_operations,
     execute_plan,
+    parse_remote_address,
     summarize_operations,
 )
 from .state_db import (
@@ -157,6 +164,11 @@ def _row_to_diff(row: dict[str, object]) -> DiffRecord:
         metadata_state=MetadataState(str(row["metadata_state"])),
         metadata_diff=tuple(str(item) for item in row.get("metadata_diff", [])),
         metadata_details=tuple(str(item) for item in row.get("metadata_details", [])),
+        metadata_source=(
+            str(row["metadata_source"])
+            if row.get("metadata_source") is not None
+            else None
+        ),
     )
 
 
@@ -170,9 +182,9 @@ def _op_label(kind: str) -> str:
     if kind == "delete_left":
         return "delete local"
     if kind == "metadata_update_right":
-        return "sync metadata on remote"
+        return "copy metadata from local"
     if kind == "metadata_update_left":
-        return "sync metadata on local"
+        return "copy metadata from remote"
     return kind
 
 
@@ -181,6 +193,43 @@ def _ops_text(kinds: list[str]) -> str:
         return "-"
     labels = [_op_label(kind) for kind in kinds]
     return ", ".join(labels)
+
+
+def _parse_metadata_details(details: list[str]) -> dict[str, str]:
+    parsed: dict[str, str] = {}
+    mode_re = re.compile(r"mode:\s+local=(0x[0-7]{3})\s+remote=(0x[0-7]{3})")
+    mtime_re = re.compile(r"mtime:\s+local=(.*?)\s+remote=(.*?)$")
+    for detail in details:
+        mode_match = mode_re.match(detail)
+        if mode_match:
+            parsed["mode_local"] = mode_match.group(1)
+            parsed["mode_remote"] = mode_match.group(2)
+            continue
+        mtime_match = mtime_re.match(detail)
+        if mtime_match:
+            parsed["mtime_local"] = mtime_match.group(1)
+            parsed["mtime_remote"] = mtime_match.group(2)
+    return parsed
+
+
+def _suggested_action_with_reason(entry: FileEntry, suggested_ops: list[str]) -> str:
+    if not suggested_ops:
+        return "-"
+    primary = suggested_ops[0]
+    if primary not in {"metadata_update_left", "metadata_update_right"}:
+        return _ops_text(suggested_ops)
+
+    source = "local" if primary == "metadata_update_right" else "remote"
+    parsed = _parse_metadata_details(entry.metadata_details)
+    if "mode" in entry.metadata_diff and parsed.get("mode_local") != parsed.get(
+        "mode_remote"
+    ):
+        return f"copy more restrictive metadata from {source}"
+    if "mtime" in entry.metadata_diff and parsed.get("mtime_local") != parsed.get(
+        "mtime_remote"
+    ):
+        return f"copy older metadata from {source}"
+    return f"copy metadata from {source}"
 
 
 def _ops_direction_marker(kinds: list[str]) -> str:
@@ -208,12 +257,16 @@ def _ops_direction_marker(kinds: list[str]) -> str:
 class ConfirmApplyModal(ModalScreen[bool]):
     BINDINGS = [
         ("escape", "cancel", "Cancel"),
-        ("enter", "confirm", "Confirm"),
+        ("enter", "activate_focused", "Confirm"),
+        ("left", "focus_prev_button", "Prev"),
+        ("right", "focus_next_button", "Next"),
         ("a", "confirm", "Apply"),
         ("c", "cancel", "Cancel"),
     ]
     CSS = """
-    ModalScreen {
+    #confirm-root {
+        width: 100%;
+        height: 100%;
         align: center middle;
     }
     #confirm-box {
@@ -232,7 +285,7 @@ class ConfirmApplyModal(ModalScreen[bool]):
         self.total_operations = total_operations
 
     def compose(self) -> ComposeResult:
-        with Center():
+        with Container(id="confirm-root"):
             with Vertical(id="confirm-box"):
                 yield Static(
                     f"Apply {self.total_operations} planned operations?\nThis cannot be automatically rolled back."
@@ -247,11 +300,37 @@ class ConfirmApplyModal(ModalScreen[bool]):
         else:
             self.dismiss(False)
 
+    def on_mount(self) -> None:
+        self.query_one("#cancel", Button).focus()
+
     def action_cancel(self) -> None:
         self.dismiss(False)
 
     def action_confirm(self) -> None:
         self.dismiss(True)
+
+    def action_focus_prev_button(self) -> None:
+        apply_btn = self.query_one("#apply", Button)
+        cancel_btn = self.query_one("#cancel", Button)
+        if apply_btn.has_focus:
+            cancel_btn.focus()
+        else:
+            apply_btn.focus()
+
+    def action_focus_next_button(self) -> None:
+        self.action_focus_prev_button()
+
+    def action_activate_focused(self) -> None:
+        apply_btn = self.query_one("#apply", Button)
+        cancel_btn = self.query_one("#cancel", Button)
+        if apply_btn.has_focus:
+            self.dismiss(True)
+            return
+        if cancel_btn.has_focus:
+            self.dismiss(False)
+            return
+        # Safe default if focus is elsewhere.
+        self.dismiss(False)
 
 
 class ApplyRunModal(ModalScreen[ExecuteResult | None]):
@@ -261,17 +340,23 @@ class ApplyRunModal(ModalScreen[ExecuteResult | None]):
         ("c", "close_if_done", "Close"),
     ]
     CSS = """
-    ModalScreen {
+    #apply-root {
+        width: 100%;
+        height: 100%;
         align: center middle;
     }
     #apply-box {
         width: 110;
-        height: 70%;
+        height: auto;
+        max-height: 90%;
         border: round #666666;
         padding: 1;
     }
+    #apply-progress {
+        width: 100%;
+    }
     #errors {
-        height: 1fr;
+        height: 12;
         border: round #444444;
         padding: 1;
     }
@@ -293,7 +378,7 @@ class ApplyRunModal(ModalScreen[ExecuteResult | None]):
         self.result: ExecuteResult | None = None
 
     def compose(self) -> ComposeResult:
-        with Center():
+        with Container(id="apply-root"):
             with Vertical(id="apply-box"):
                 yield Static("Applying plan...", id="apply-status")
                 yield ProgressBar(
@@ -362,6 +447,100 @@ class ApplyRunModal(ModalScreen[ExecuteResult | None]):
         if close_btn.disabled:
             return
         self.dismiss(self.result)
+
+
+class OpenSideModal(ModalScreen[str | None]):
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        ("enter", "activate_focused", "Confirm"),
+        ("left", "focus_prev_button", "Prev"),
+        ("right", "focus_next_button", "Next"),
+        ("l", "open_left", "Open Left"),
+        ("r", "open_right", "Open Right"),
+        ("c", "cancel", "Cancel"),
+    ]
+    CSS = """
+    #open-side-root {
+        width: 100%;
+        height: 100%;
+        align: center middle;
+    }
+    #open-side-box {
+        width: 72;
+        height: auto;
+        border: round #666666;
+        padding: 1 2;
+    }
+    #open-side-buttons {
+        height: auto;
+    }
+    """
+
+    def __init__(self, relpath: str) -> None:
+        super().__init__()
+        self.relpath = relpath
+
+    def compose(self) -> ComposeResult:
+        with Container(id="open-side-root"):
+            with Vertical(id="open-side-box"):
+                yield Static(f"Open which side?\n{self.relpath}")
+                with Horizontal(id="open-side-buttons"):
+                    yield Button("Cancel [C]", id="cancel")
+                    yield Button("Open Left [L]", id="left")
+                    yield Button("Open Right [R]", id="right")
+
+    def on_mount(self) -> None:
+        self.query_one("#left", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "left":
+            self.dismiss("left")
+        elif event.button.id == "right":
+            self.dismiss("right")
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_open_left(self) -> None:
+        self.dismiss("left")
+
+    def action_open_right(self) -> None:
+        self.dismiss("right")
+
+    def action_focus_prev_button(self) -> None:
+        left_btn = self.query_one("#left", Button)
+        right_btn = self.query_one("#right", Button)
+        cancel_btn = self.query_one("#cancel", Button)
+        if left_btn.has_focus:
+            cancel_btn.focus()
+        elif right_btn.has_focus:
+            left_btn.focus()
+        else:
+            right_btn.focus()
+
+    def action_focus_next_button(self) -> None:
+        left_btn = self.query_one("#left", Button)
+        right_btn = self.query_one("#right", Button)
+        cancel_btn = self.query_one("#cancel", Button)
+        if left_btn.has_focus:
+            right_btn.focus()
+        elif right_btn.has_focus:
+            cancel_btn.focus()
+        else:
+            left_btn.focus()
+
+    def action_activate_focused(self) -> None:
+        left_btn = self.query_one("#left", Button)
+        right_btn = self.query_one("#right", Button)
+        if left_btn.has_focus:
+            self.dismiss("left")
+            return
+        if right_btn.has_focus:
+            self.dismiss("right")
+            return
+        self.dismiss(None)
 
 
 def _build_model(
@@ -462,6 +641,7 @@ class ReviewApp(App[None]):
         ("q", "quit", "Quit"),
         ("h", "toggle_hide_identical", "Hide Identical"),
         ("enter", "toggle_cursor_node", "Open/Close"),
+        ("o", "open_selected", "Open"),
         ("l", "apply_left_wins", "Left Wins"),
         ("r", "apply_right_wins", "Right Wins"),
         ("i", "apply_ignore", "Ignore"),
@@ -487,6 +667,7 @@ class ReviewApp(App[None]):
         self._apply_required_ops: dict[str, set[str]] = {}
         self._apply_done_ops: dict[str, set[str]] = {}
         self._apply_newly_completed: set[str] = set()
+        self._open_temp_dir: Path | None = None
 
         self._reload_state()
         self.action_overrides = load_action_overrides(self.db_path)
@@ -578,6 +759,7 @@ class ReviewApp(App[None]):
                 ("q", "quit", "Quit"),
                 ("h", "toggle_hide_identical", label),
                 ("enter", "toggle_cursor_node", "Open/Close"),
+                ("o", "open_selected", "Open"),
                 ("l", "apply_left_wins", "Left Wins"),
                 ("r", "apply_right_wins", "Right Wins"),
                 ("i", "apply_ignore", "Ignore"),
@@ -632,8 +814,7 @@ class ReviewApp(App[None]):
             f"Uncertain: {c.uncertain}",
             "",
             f"Hide identical folders: {'ON' if self.hide_identical else 'OFF'}",
-            "Actions: l=left wins r=right wins i=ignore s=suggested a=apply",
-            "Keys: arrows navigate, enter open/close, h toggle identical, q quit",
+            "Actions: o=open l=left wins r=right wins i=ignore s=suggested",
         ]
         self.query_one("#info", Static).update("\n".join(lines))
 
@@ -643,25 +824,148 @@ class ReviewApp(App[None]):
             entry.relpath, self._effective_action(entry.relpath)
         )
         lines = [f"File: {entry.relpath}", ""]
-        if entry.content_state != "identical":
+        if entry.content_state not in {"identical", "unknown"}:
             lines.append(f"Content state: {entry.content_state}")
-        if entry.metadata_details:
-            lines.append(f"Metadata: {' | '.join(entry.metadata_details)}")
+        if entry.metadata_state == "different":
+            parsed = _parse_metadata_details(entry.metadata_details)
+            if parsed.get("mode_local") != parsed.get("mode_remote"):
+                lines.append(
+                    f"Permissions: local={parsed.get('mode_local', '?')} remote={parsed.get('mode_remote', '?')}"
+                )
+            if parsed.get("mtime_local") != parsed.get("mtime_remote"):
+                lines.append(
+                    f"MTime: local={parsed.get('mtime_local', '?')} remote={parsed.get('mtime_remote', '?')}"
+                )
         lines.extend(
             [
-                f"Suggested operations: {_ops_text(suggested_ops)}",
+                f"Suggested action: {_suggested_action_with_reason(entry, suggested_ops)}",
                 f"Current action: {self._effective_action(entry.relpath)}",
                 f"Current operations: {_ops_text(current_ops)}",
                 "",
-                "Actions: l=left wins r=right wins i=ignore s=suggested a=apply",
-                "Keys: arrows navigate, enter open/close, h toggle identical, q quit",
+                "Actions: o=open l=left wins r=right wins i=ignore s=suggested",
             ]
         )
         self.query_one("#info", Static).update("\n".join(lines))
 
-    def _update_plan_panel(
-        self, *, plan_ops_override: list | None = None, include_selection: bool = True
-    ) -> None:
+    def _selected_file_relpath(self) -> str | None:
+        selected = self._current_selection()
+        if selected is None:
+            return None
+        kind, relpath = selected
+        if kind != "file":
+            return None
+        if relpath not in self.files_by_relpath:
+            return None
+        return relpath
+
+    def _open_with_default_app(self, file_path: Path) -> None:
+        if platform.system() == "Darwin":
+            cmd = ["open", str(file_path)]
+        elif platform.system() == "Windows":
+            cmd = ["cmd", "/c", "start", "", str(file_path)]
+        else:
+            cmd = ["xdg-open", str(file_path)]
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    def _notify_message(self, message: str, severity: str = "information") -> None:
+        try:
+            self.notify(message, severity=severity, timeout=4)
+        except Exception:  # noqa: BLE001
+            # Fallback for older textual versions.
+            self.status_message = message
+            self._update_plan_panel()
+
+    def _candidate_relpaths(self, relpath: str) -> list[str]:
+        candidates: list[str] = [relpath]
+        nfc = unicodedata.normalize("NFC", relpath)
+        nfd = unicodedata.normalize("NFD", relpath)
+        if nfc not in candidates:
+            candidates.append(nfc)
+        if nfd not in candidates:
+            candidates.append(nfd)
+        return candidates
+
+    def _download_remote_file(self, relpath: str) -> Path:
+        user, host, remote_root = parse_remote_address(self.remote_address)
+        if self._open_temp_dir is None:
+            self._open_temp_dir = Path(tempfile.mkdtemp(prefix="li-sync-open-"))
+        target = self._open_temp_dir / relpath
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        client = paramiko.SSHClient()
+        client.load_system_host_keys()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+            hostname=host,
+            username=user,
+            port=22,
+            look_for_keys=True,
+            allow_agent=True,
+            timeout=10,
+        )
+        sftp = client.open_sftp()
+        try:
+            # Expand ~ on remote shell, then resolve via SFTP.
+            quoted = remote_root.replace("'", "'\\''")
+            _stdin, stdout, _stderr = client.exec_command(
+                f"python3 -c \"import os; print(os.path.expanduser('{quoted}'))\""
+            )
+            expanded = (
+                stdout.read().decode("utf-8", errors="replace").strip() or remote_root
+            )
+            remote_root_abs = sftp.normalize(expanded)
+
+            last_error: Exception | None = None
+            for rel_candidate in self._candidate_relpaths(relpath):
+                remote_path = str(
+                    PurePosixPath(remote_root_abs) / PurePosixPath(rel_candidate)
+                )
+                try:
+                    sftp.get(remote_path, str(target))
+                    return target
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    continue
+            if last_error is not None:
+                raise last_error
+        finally:
+            sftp.close()
+            client.close()
+        return target
+
+    def _has_local_copy(self, relpath: str) -> bool:
+        diff = self.diffs_by_relpath.get(relpath)
+        return diff is not None and diff.content_state != ContentState.ONLY_REMOTE
+
+    def _has_remote_copy(self, relpath: str) -> bool:
+        diff = self.diffs_by_relpath.get(relpath)
+        return diff is not None and diff.content_state != ContentState.ONLY_LOCAL
+
+    def _open_file_side(self, relpath: str, side: str) -> None:
+        try:
+            if side == "left":
+                path = self.local_root / relpath
+                self._open_with_default_app(path)
+                self._notify_message(f"Opened local file: {relpath}")
+            else:
+                downloaded = self._download_remote_file(relpath)
+                self._open_with_default_app(downloaded)
+                self._notify_message(f"Opened remote file: {relpath}")
+        except Exception as exc:  # noqa: BLE001
+            self._notify_message(f"Open failed: {exc}", severity="error")
+
+    def _on_open_side_chosen(self, relpath: str, side: str | None) -> None:
+        if side is None:
+            self._notify_message("Open cancelled.")
+            return
+        self._open_file_side(relpath, side)
+
+    def _update_plan_panel(self, *, plan_ops_override: list | None = None) -> None:
         plan_ops = (
             plan_ops_override
             if plan_ops_override is not None
@@ -672,15 +976,6 @@ class ReviewApp(App[None]):
         if new_can_apply != self.can_apply:
             self.can_apply = new_can_apply
             self._sync_hide_binding_label()
-
-        selected_changed: list[str] = []
-        if include_selection:
-            selected_changed = [
-                relpath
-                for relpath in self._selected_target_files()
-                if relpath in self.files_by_relpath
-                and _is_changed(self.files_by_relpath[relpath])
-            ]
 
         lines = ["Plan Summary", ""]
         if summary.delete_left:
@@ -699,24 +994,6 @@ class ReviewApp(App[None]):
             lines.append("no operations planned")
         else:
             lines.append(f"total operations: {summary.total}")
-        if include_selection:
-            lines.extend(
-                [
-                    "",
-                    f"Selection targets: {len(selected_changed)}",
-                    "Selection actions:",
-                ]
-            )
-
-            if not selected_changed:
-                lines.append("-")
-            else:
-                for relpath in selected_changed[:20]:
-                    action = self._effective_action(relpath)
-                    ops = self._operations_for_entry(relpath, action)
-                    lines.append(f"{relpath} -> {action} ({_ops_text(ops)})")
-                if len(selected_changed) > 20:
-                    lines.append(f"... and {len(selected_changed) - 20} more")
 
         if self.status_message:
             lines.extend(["", f"Status: {self.status_message}"])
@@ -913,9 +1190,7 @@ class ReviewApp(App[None]):
             )
         else:
             self.status_message = f"Applied {result.succeeded_operations}/{result.total_operations} operations."
-        self._update_plan_panel(
-            plan_ops_override=remaining_ops, include_selection=False
-        )
+        self._update_plan_panel(plan_ops_override=remaining_ops)
 
     def action_apply_plan_disabled(self) -> None:
         self.status_message = "No operations in plan."
@@ -986,6 +1261,30 @@ class ReviewApp(App[None]):
 
     def action_apply_suggested(self) -> None:
         self._apply_action(ACTION_SUGGESTED)
+
+    def action_open_selected(self) -> None:
+        relpath = self._selected_file_relpath()
+        if relpath is None:
+            self._notify_message("Select a file to open.", severity="warning")
+            return
+
+        has_local = self._has_local_copy(relpath)
+        has_remote = self._has_remote_copy(relpath)
+        if has_local and has_remote:
+            self.push_screen(
+                OpenSideModal(relpath),
+                callback=lambda side: self._on_open_side_chosen(relpath, side),
+            )
+            return
+
+        if has_local:
+            self._open_file_side(relpath, "left")
+            return
+        if has_remote:
+            self._open_file_side(relpath, "right")
+            return
+
+        self._notify_message("File not found on either side.", severity="warning")
 
 
 def run_review_tui(
