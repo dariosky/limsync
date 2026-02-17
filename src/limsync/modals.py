@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
@@ -10,7 +11,7 @@ from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, ProgressBar, Static, Tree
 
-from .planner_apply import ExecuteResult, PlanOperation, execute_plan
+from .planner_apply import ApplySettings, ExecuteResult, PlanOperation, execute_plan
 
 
 def _op_label(kind: str) -> str:
@@ -156,6 +157,7 @@ class ApplyRunModal(ModalScreen[ExecuteResult | None]):
         local_root: Path,
         remote_address: str,
         operations: list,
+        apply_settings: ApplySettings | None = None,
         progress_event_cb: Callable[[int, int, object, bool, str | None], None]
         | None = None,
     ) -> None:
@@ -163,6 +165,7 @@ class ApplyRunModal(ModalScreen[ExecuteResult | None]):
         self.local_root = local_root
         self.remote_address = remote_address
         self.operations = operations
+        self.apply_settings = apply_settings or ApplySettings()
         self.progress_event_cb = progress_event_cb
         self.result: ExecuteResult | None = None
 
@@ -181,7 +184,24 @@ class ApplyRunModal(ModalScreen[ExecuteResult | None]):
         self.run_worker(self._run_apply(), exclusive=True)
 
     async def _run_apply(self) -> None:
+        last_emit = 0.0
+        pending_ops = 0
+
         def progress_cb(done: int, total: int, op, ok: bool, error: str | None) -> None:
+            nonlocal last_emit, pending_ops
+            pending_ops += 1
+            now = time.monotonic()
+            emit = (
+                done == total
+                or not ok
+                or pending_ops >= self.apply_settings.progress_emit_every_ops
+                or (now - last_emit) * 1000.0
+                >= self.apply_settings.progress_emit_every_ms
+            )
+            if not emit:
+                return
+            pending_ops = 0
+            last_emit = now
             self.app.call_from_thread(self._on_progress, done, total, op, ok, error)
 
         try:
@@ -191,10 +211,22 @@ class ApplyRunModal(ModalScreen[ExecuteResult | None]):
                 self.remote_address,
                 self.operations,
                 progress_cb,
+                self.apply_settings,
             )
             self.result = result
+            top_costly = sorted(
+                result.operation_seconds.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:3]
+            timing_suffix = ""
+            if top_costly:
+                timing_suffix = "  slowest: " + ", ".join(
+                    f"{kind}={seconds:.2f}s ({result.operation_counts.get(kind, 0)})"
+                    for kind, seconds in top_costly
+                )
             self.query_one("#apply-status", Static).update(
-                f"Completed {result.succeeded_operations}/{result.total_operations} operations."
+                f"Completed {result.succeeded_operations}/{result.total_operations} operations.{timing_suffix}"
             )
             if result.errors:
                 error_text = "Errors:\n" + "\n".join(result.errors[:100])
@@ -437,6 +469,7 @@ class CommandsModal(ModalScreen[str | None]):
     COMMANDS: list[tuple[str, str]] = [
         ("h", "toggle_hide_identical"),
         ("o", "open_selected"),
+        ("U", "update_selected_path"),
         ("D", "delete_selected_both"),
         ("F", "diff_selected"),
         ("P", "copy_selected_path"),
@@ -455,6 +488,7 @@ class CommandsModal(ModalScreen[str | None]):
         descriptions = {
             "h": "show/hide identical",
             "o": "open",
+            "U": "rescan selected path",
             "D": "delete file/folder both sides",
             "F": "diff",
             "P": "copy path",

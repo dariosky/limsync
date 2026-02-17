@@ -12,7 +12,9 @@ from limsync.planner_apply import (
     ACTION_LEFT_WINS,
     ACTION_RIGHT_WINS,
     ACTION_SUGGESTED,
+    ApplySettings,
     PlanOperation,
+    _ensure_remote_parent_cached,
     _infer_metadata_source_from_details,
     _join_remote,
     _remote_atime_ns,
@@ -195,8 +197,34 @@ def test_execute_plan_copy_right_and_delete_right(tmp_path, monkeypatch) -> None
     assert result.succeeded_operations == 2
     assert result.errors == []
     assert result.completed_paths == {"a.txt"}
+    assert ("copy_right", "a.txt") in result.succeeded_operation_keys
     assert progress[-1][0] == 2
     assert progress[-1][1] == 2
+
+
+def test_ensure_remote_parent_cached_reuses_known_dirs() -> None:
+    sftp = FakeSFTPClient()
+    sftp.existing_dirs.update({"/remote"})
+    known_dirs = {"/", "/remote"}
+
+    _ensure_remote_parent_cached(
+        sftp,
+        "/remote/a/b/c.txt",
+        known_dirs=known_dirs,
+    )
+    first_stats = [call for call in sftp.calls if call[0] == "stat"]
+    assert len(first_stats) == 2
+    assert "/remote/a" in known_dirs
+    assert "/remote/a/b" in known_dirs
+
+    sftp.calls.clear()
+    _ensure_remote_parent_cached(
+        sftp,
+        "/remote/a/b/d.txt",
+        known_dirs=known_dirs,
+    )
+    second_stats = [call for call in sftp.calls if call[0] == "stat"]
+    assert second_stats == []
 
 
 def test_execute_plan_copy_left_and_delete_left(tmp_path, monkeypatch) -> None:
@@ -229,6 +257,57 @@ def test_execute_plan_copy_left_and_delete_left(tmp_path, monkeypatch) -> None:
     assert not to_delete.exists()
     assert result.total_operations == 2
     assert result.succeeded_operations == 2
+
+
+def test_execute_plan_put_uses_confirm_false_by_default(tmp_path, monkeypatch) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    src = local_root / "a.txt"
+    src.write_text("hello", encoding="utf-8")
+
+    sftp = FakeSFTPClient()
+    sftp.existing_dirs.add("/remote")
+    ssh = FakeSSHClient(sftp)
+
+    from limsync import planner_apply as pa
+
+    monkeypatch.setattr(pa.paramiko, "SSHClient", lambda: ssh)
+    monkeypatch.setattr(pa.paramiko, "AutoAddPolicy", DummyAutoAddPolicy)
+    monkeypatch.setattr(pa, "_remote_expand_root", lambda _client, _root: "/remote")
+
+    execute_plan(
+        local_root,
+        "u@h:~/x",
+        [PlanOperation("copy_right", "a.txt")],
+    )
+
+    put_calls = [call for call in sftp.calls if call[0] == "put"]
+    assert put_calls
+    assert put_calls[0][-1] is False
+
+
+def test_execute_plan_connect_respects_ssh_compression(tmp_path, monkeypatch) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    sftp = FakeSFTPClient()
+    sftp.existing_dirs.add("/remote")
+    ssh = FakeSSHClient(sftp)
+
+    from limsync import planner_apply as pa
+
+    monkeypatch.setattr(pa.paramiko, "SSHClient", lambda: ssh)
+    monkeypatch.setattr(pa.paramiko, "AutoAddPolicy", DummyAutoAddPolicy)
+    monkeypatch.setattr(pa, "_remote_expand_root", lambda _client, _root: "/remote")
+
+    execute_plan(
+        local_root,
+        "u@h:~/x",
+        [PlanOperation("delete_right", "missing.txt")],
+        settings=ApplySettings(ssh_compression=True),
+    )
+
+    assert ssh.connect_calls
+    assert ssh.connect_calls[0]["compress"] is True
 
 
 def test_execute_plan_metadata_bidirectional_uses_restrictive_and_oldest(tmp_path, monkeypatch) -> None:
@@ -327,6 +406,7 @@ def test_execute_plan_partial_failures_and_completed_paths(tmp_path, monkeypatch
     assert len(result.errors) == 1
     assert result.errors[0].startswith("delete_left missing.txt:")
     assert result.completed_paths == {"ok.txt"}
+    assert ("copy_right", "ok.txt") in result.succeeded_operation_keys
 
 
 def test_remote_expand_root_success_and_error() -> None:

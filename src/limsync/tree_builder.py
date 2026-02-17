@@ -90,37 +90,41 @@ def _is_changed(entry: FileEntry) -> bool:
     )
 
 
-def _folder_label(entry: DirEntry) -> Text:
+def _folder_label(entry: DirEntry, *, include_identical: bool = True) -> Text:
     c = entry.counts
-    extra = []
+    parts: list[str] = []
+    if c.only_remote:
+        parts.append(f"Right {c.only_remote}")
+    if c.only_local:
+        parts.append(f"Left {c.only_local}")
     if c.different:
-        extra.append(f"D {c.different}")
+        parts.append(f"Conflict {c.different}")
+    if c.metadata_only:
+        parts.append(f"Metadata {c.metadata_only}")
+    if include_identical and c.identical:
+        parts.append(f"Identical {c.identical}")
     if c.uncertain:
-        extra.append(f"U {c.uncertain}")
-    summary = (
-        f"L {c.only_local} | R {c.only_remote} | I {c.identical} | M {c.metadata_only}"
-    )
-    if extra:
-        summary = f"{summary} | {' | '.join(extra)}"
+        parts.append(f"Uncertain {c.uncertain}")
+    summary = " | ".join(parts) if parts else "No changes"
     return Text.assemble((entry.name, "bold"), "  ", (summary, "cyan"))
 
 
 def _file_label(file_entry: FileEntry) -> Text:
     if file_entry.content_state == "only_local":
-        badge = "L"
+        badge = "Left"
     elif file_entry.content_state == "only_remote":
-        badge = "R"
+        badge = "Right"
     elif file_entry.content_state == "different":
-        badge = "D"
+        badge = "Conflict"
     elif file_entry.content_state == "unknown":
-        badge = "U"
+        badge = "Uncertain"
     elif (
         file_entry.content_state == "identical"
         and file_entry.metadata_state == "different"
     ):
-        badge = "M"
+        badge = "Metadata"
     else:
-        badge = "I"
+        badge = "Identical"
     meta = ",".join(file_entry.metadata_diff) if file_entry.metadata_diff else "-"
     return Text.assemble(
         (file_entry.name, "white"), "  ", (f"[{badge}]", "yellow"), " ", (meta, "green")

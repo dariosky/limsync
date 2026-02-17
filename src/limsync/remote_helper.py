@@ -221,7 +221,29 @@ def update_state_db(
         conn.close()
 
 
-def run_scan(root_arg: str, state_db: str, progress_interval: float) -> int:
+def _normalize_subtree(subtree: str | None) -> PurePosixPath:
+    if not subtree or subtree in {"", "."}:
+        return PurePosixPath(".")
+    return PurePosixPath(subtree)
+
+
+def _prime_rules_for_subtree(
+    rules: IgnoreRules, root: str, subtree_rel: PurePosixPath
+) -> None:
+    rules.load_if_exists(root, PurePosixPath("."))
+    if subtree_rel == PurePosixPath("."):
+        return
+    current = PurePosixPath(".")
+    for part in subtree_rel.parts[:-1]:
+        current = (
+            PurePosixPath(part) if current == PurePosixPath(".") else current / part
+        )
+        rules.load_if_exists(root, current)
+
+
+def run_scan(
+    root_arg: str, state_db: str, progress_interval: float, subtree: str | None = None
+) -> int:
     root = os.path.expanduser(root_arg)
     root = os.path.abspath(root)
     if not os.path.isdir(root):
@@ -229,6 +251,8 @@ def run_scan(root_arg: str, state_db: str, progress_interval: float) -> int:
         return 2
 
     rules = IgnoreRules()
+    subtree_rel = _normalize_subtree(subtree)
+    _prime_rules_for_subtree(rules, root, subtree_rel)
     records_for_db: list[tuple[str, str, int, int, int]] = []
 
     dirs_scanned = 0
@@ -247,8 +271,28 @@ def run_scan(root_arg: str, state_db: str, progress_interval: float) -> int:
             }
         )
 
+    start_root = root
+    if subtree_rel != PurePosixPath("."):
+        start_candidate = os.path.join(root, subtree_rel.as_posix())
+        if os.path.isfile(start_candidate) or os.path.islink(start_candidate):
+            start_root = os.path.dirname(start_candidate)
+        elif os.path.isdir(start_candidate):
+            start_root = start_candidate
+        else:
+            emit(
+                {
+                    "event": "done",
+                    "root": root,
+                    "dirs_scanned": 0,
+                    "files_seen": 0,
+                    "errors": 0,
+                    "state_db": os.path.expanduser(state_db),
+                }
+            )
+            return 0
+
     for current_dir, dirs, files in os.walk(
-        root, topdown=True, onerror=on_walk_error, followlinks=False
+        start_root, topdown=True, onerror=on_walk_error, followlinks=False
     ):
         current_abs = os.path.abspath(current_dir)
         rel_dir = os.path.relpath(current_abs, root)
@@ -331,11 +375,12 @@ def run_scan(root_arg: str, state_db: str, progress_interval: float) -> int:
                 )
             )
 
-    try:
-        update_state_db(state_db, root, records_for_db, dirs_scanned, files_seen)
-    except Exception as exc:
-        emit({"event": "error", "message": f"state_db_update_failed: {exc}"})
-        errors += 1
+    if subtree_rel == PurePosixPath("."):
+        try:
+            update_state_db(state_db, root, records_for_db, dirs_scanned, files_seen)
+        except Exception as exc:
+            emit({"event": "error", "message": f"state_db_update_failed: {exc}"})
+            errors += 1
 
     emit(
         {
@@ -356,12 +401,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--root", required=True)
     parser.add_argument("--state-db", default=".limsync/state.sqlite3")
     parser.add_argument("--progress-interval", type=float, default=0.25)
+    parser.add_argument("--subtree", default=None)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    return run_scan(args.root, args.state_db, args.progress_interval)
+    return run_scan(args.root, args.state_db, args.progress_interval, args.subtree)
 
 
 if __name__ == "__main__":

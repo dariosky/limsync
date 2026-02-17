@@ -26,17 +26,24 @@ class LocalScanner:
     def scan(
         self,
         progress_cb: Callable[[PurePosixPath, int, int], None] | None = None,
+        subtree: PurePosixPath | None = None,
     ) -> dict[str, FileRecord]:
         if not self.root.exists() or not self.root.is_dir():
             raise FileNotFoundError(f"Local root not found: {self.root}")
 
         records: dict[str, FileRecord] = {}
         rules = IgnoreRules()
+        subtree_rel = self._normalize_subtree(subtree)
+        self._prime_rules_for_subtree(rules, subtree_rel)
         dirs_scanned = 0
         files_seen = 0
         last_progress = 0.0
 
-        for current_dir, dirs, files in os.walk(self.root, topdown=True):
+        start_root = self._scan_start_path(subtree_rel)
+        if start_root is None:
+            return records
+
+        for current_dir, dirs, files in os.walk(start_root, topdown=True):
             current_path = Path(current_dir)
             rel_dir = PurePosixPath(".")
             if current_path != self.root:
@@ -97,3 +104,37 @@ class LocalScanner:
             progress_cb(PurePosixPath("."), dirs_scanned, files_seen)
 
         return records
+
+    def _normalize_subtree(self, subtree: PurePosixPath | None) -> PurePosixPath:
+        if subtree is None:
+            return PurePosixPath(".")
+        text = (
+            subtree.as_posix() if isinstance(subtree, PurePosixPath) else str(subtree)
+        )
+        normalized = PurePosixPath(text)
+        if str(normalized) in {"", "."}:
+            return PurePosixPath(".")
+        return normalized
+
+    def _scan_start_path(self, subtree: PurePosixPath) -> Path | None:
+        if subtree == PurePosixPath("."):
+            return self.root
+        candidate = self.root / subtree.as_posix()
+        if candidate.is_file() or candidate.is_symlink():
+            return candidate.parent
+        if candidate.is_dir():
+            return candidate
+        return None
+
+    def _prime_rules_for_subtree(
+        self, rules: IgnoreRules, subtree: PurePosixPath
+    ) -> None:
+        rules.load_if_exists(self.root, PurePosixPath("."))
+        if subtree == PurePosixPath("."):
+            return
+        current = PurePosixPath(".")
+        for part in subtree.parts[:-1]:
+            current = (
+                PurePosixPath(part) if current == PurePosixPath(".") else current / part
+            )
+            rules.load_if_exists(self.root, current)

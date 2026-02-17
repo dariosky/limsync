@@ -21,6 +21,7 @@ from .config import (
 )
 from .excludes import load_ignore_rules_tree
 from .models import ContentState, FileRecord, MetadataState
+from .planner_apply import ApplySettings
 from .review_tui import run_review_tui
 from .scanner_local import LocalScanner
 from .scanner_remote import RemoteScanner
@@ -130,6 +131,11 @@ def scan(
     open_review: bool = typer.Option(
         True,
         help="Open interactive review UI after scan",
+    ),
+    apply_ssh_compression: bool = typer.Option(
+        False,
+        "--apply-ssh-compression/--no-apply-ssh-compression",
+        help="Enable SSH transport compression during apply operations in the review UI.",
     ),
 ) -> None:
     """Scan local and remote trees, store run status, and open review UI."""
@@ -284,6 +290,7 @@ def scan(
             local_root=local_root,
             remote_address=remote_cfg.address,
             hide_identical=resolved_hide_identical,
+            apply_settings=ApplySettings(ssh_compression=apply_ssh_compression),
         )
     else:
         console.print(
@@ -304,6 +311,11 @@ def review(
     hide_identical: bool | None = typer.Option(
         None,
         help="Hide folders that are completely identical (default: persisted preference)",
+    ),
+    apply_ssh_compression: bool = typer.Option(
+        False,
+        "--apply-ssh-compression/--no-apply-ssh-compression",
+        help="Enable SSH transport compression during apply operations.",
     ),
 ) -> None:
     """Open interactive tree review UI for the current saved scan state."""
@@ -333,6 +345,7 @@ def review(
         local_root=resolved_local_root,
         remote_address=context.remote_address,
         hide_identical=resolved_hide_identical,
+        apply_settings=ApplySettings(ssh_compression=apply_ssh_compression),
     )
 
 

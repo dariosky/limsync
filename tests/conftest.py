@@ -106,9 +106,9 @@ class FakeSFTPClient:
         self.calls.append(("mkdir", path))
         self.existing_dirs.add(path)
 
-    def put(self, local_path: str, remote_path: str) -> None:
+    def put(self, local_path: str, remote_path: str, *, confirm: bool = True) -> None:
         self._check_failure("put", remote_path)
-        self.calls.append(("put", local_path, remote_path))
+        self.calls.append(("put", local_path, remote_path, confirm))
         data = Path(local_path).read_bytes()
         self.remote_files[remote_path] = data
         self.remote_stats.setdefault(remote_path, self._default_file_stat())

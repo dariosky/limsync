@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import re
 import stat
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -51,6 +52,19 @@ class ExecuteResult:
     errors: list[str]
     succeeded_operations: int
     total_operations: int
+    succeeded_operation_keys: frozenset[tuple[str, str]] = field(
+        default_factory=frozenset
+    )
+    operation_counts: dict[str, int] = field(default_factory=dict)
+    operation_seconds: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ApplySettings:
+    ssh_compression: bool = False
+    sftp_put_confirm: bool = False
+    progress_emit_every_ops: int = 100
+    progress_emit_every_ms: int = 200
 
 
 def parse_remote_address(remote_address: str) -> tuple[str, str, str]:
@@ -174,6 +188,14 @@ def _ensure_local_parent(path: Path) -> None:
 
 
 def _ensure_remote_parent(sftp: paramiko.SFTPClient, remote_path: str) -> None:
+    _ensure_remote_parent_cached(sftp, remote_path, known_dirs=None)
+
+
+def _ensure_remote_parent_cached(
+    sftp: paramiko.SFTPClient,
+    remote_path: str,
+    known_dirs: set[str] | None,
+) -> None:
     parent = os.path.dirname(remote_path)
     if not parent:
         return
@@ -182,10 +204,14 @@ def _ensure_remote_parent(sftp: paramiko.SFTPClient, remote_path: str) -> None:
         parts.append(parent)
         parent = os.path.dirname(parent)
     for segment in reversed(parts):
+        if known_dirs is not None and segment in known_dirs:
+            continue
         try:
             sftp.stat(segment)
         except OSError:
             sftp.mkdir(segment)
+        if known_dirs is not None:
+            known_dirs.add(segment)
 
 
 def _join_remote(root: str, relpath: str) -> str:
@@ -246,7 +272,9 @@ def execute_plan(
     operations: list[PlanOperation],
     progress_cb: Callable[[int, int, PlanOperation, bool, str | None], None]
     | None = None,
+    settings: ApplySettings | None = None,
 ) -> ExecuteResult:
+    resolved_settings = settings or ApplySettings()
     if not operations:
         return ExecuteResult(
             completed_paths=set(),
@@ -270,6 +298,7 @@ def execute_plan(
         look_for_keys=True,
         allow_agent=True,
         timeout=10,
+        compress=resolved_settings.ssh_compression,
     )
 
     errors: list[str] = []
@@ -277,10 +306,15 @@ def execute_plan(
     attempted: set[tuple[str, str]] = set()
     done_count = 0
     total = len(operations)
+    op_counts: dict[str, int] = {}
+    op_seconds: dict[str, float] = {}
+    metadata_context_cache: dict[str, tuple[os.stat_result, object, set[str]]] = {}
 
     try:
         remote_root = _remote_expand_root(client, remote_root_raw)
         sftp = client.open_sftp()
+        normalized_remote_root = remote_root.rstrip("/") or "/"
+        known_remote_dirs: set[str] = {"/", normalized_remote_root}
         try:
             for op in operations:
                 attempted.add((op.kind, op.relpath))
@@ -289,6 +323,7 @@ def execute_plan(
                 remote_path = _join_remote(remote_root, relpath)
                 ok = False
                 error: str | None = None
+                started = time.perf_counter()
 
                 try:
                     if op.kind == "copy_right":
@@ -297,8 +332,16 @@ def execute_plan(
                                 f"missing local source: {local_path}"
                             )
                         source_local_stat = local_path.lstat()
-                        _ensure_remote_parent(sftp, remote_path)
-                        sftp.put(str(local_path), remote_path)
+                        _ensure_remote_parent_cached(
+                            sftp,
+                            remote_path,
+                            known_dirs=known_remote_dirs,
+                        )
+                        sftp.put(
+                            str(local_path),
+                            remote_path,
+                            confirm=resolved_settings.sftp_put_confirm,
+                        )
                         _apply_remote_metadata_from_local(
                             sftp, remote_path, source_local_stat
                         )
@@ -318,8 +361,15 @@ def execute_plan(
                         local_path.unlink()
                         ok = True
                     elif op.kind in {"metadata_update_left", "metadata_update_right"}:
-                        lst = local_path.lstat()
-                        rst = sftp.lstat(remote_path)
+                        context = metadata_context_cache.get(relpath)
+                        if context is None:
+                            lst = local_path.lstat()
+                            rst = sftp.lstat(remote_path)
+                            op_kinds = {item.kind for item in path_ops.get(relpath, [])}
+                            context = (lst, rst, op_kinds)
+                            metadata_context_cache[relpath] = context
+                        else:
+                            lst, rst, op_kinds = context
                         local_is_symlink = stat.S_ISLNK(lst.st_mode)
                         remote_is_symlink = stat.S_ISLNK(getattr(rst, "st_mode", 0))
                         if local_is_symlink or remote_is_symlink:
@@ -337,7 +387,6 @@ def execute_plan(
                                     None,
                                 )
                             continue
-                        op_kinds = {item.kind for item in path_ops.get(relpath, [])}
                         has_left = "metadata_update_left" in op_kinds
                         has_right = "metadata_update_right" in op_kinds
 
@@ -387,6 +436,10 @@ def execute_plan(
                         error = f"unsupported operation kind: {op.kind}"
                 except Exception as exc:  # noqa: BLE001
                     error = str(exc)
+                finally:
+                    elapsed = time.perf_counter() - started
+                    op_counts[op.kind] = op_counts.get(op.kind, 0) + 1
+                    op_seconds[op.kind] = op_seconds.get(op.kind, 0.0) + elapsed
 
                 if ok:
                     succeeded.add((op.kind, op.relpath))
@@ -412,4 +465,7 @@ def execute_plan(
         errors=errors,
         succeeded_operations=len(succeeded),
         total_operations=total,
+        succeeded_operation_keys=frozenset(succeeded),
+        operation_counts=op_counts,
+        operation_seconds=op_seconds,
     )

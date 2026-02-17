@@ -47,15 +47,19 @@ uv run limsync scan \
 # Scan without opening the review UI immediately
 uv run limsync scan --no-open-review
 
+# Enable SSH compression during apply operations in the review UI
+uv run limsync scan --apply-ssh-compression
+
 # Review from local SQLite state
 uv run limsync review \
-  --local-root /Users/dario.varotto/Dropbox
+  --local-root /Users/dario.varotto/Dropbox \
+  --apply-ssh-compression
 ```
 
 ## Review UI keys
 - Arrow keys: navigate tree
 - Enter: open/close selected folder
-- `?`: show advanced Commands modal (`Up/Down` to select, `Enter` to execute), including clear plan and metadata-suggestion bulk apply
+- `?`: show advanced Commands modal (`Up/Down` to select, `Enter` to execute), including scoped path update (`U`), clear plan, and metadata-suggestion bulk apply
 - `P`: copy selected file/folder relative path to clipboard
 - `V`: view current plan as grouped action tree (copy/metadata/delete categories)
 - `h`: show/hide completely identical folders (preference persisted in SQLite)

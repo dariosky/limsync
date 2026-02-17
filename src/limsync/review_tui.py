@@ -13,19 +13,24 @@ from textual.binding import Binding, BindingsMap
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Header, Static, Tree
 
-from .models import ContentState, DiffRecord, MetadataState
+from .config import DEFAULT_STATE_SUBPATH, RemoteConfig
+from .models import ContentState, DiffRecord, FileRecord, MetadataState
 from .planner_apply import (
     ACTION_IGNORE,
     ACTION_SUGGESTED,
+    ApplySettings,
     build_plan_operations,
     parse_remote_address,
     summarize_operations,
 )
 from .review_actions import ReviewActionsMixin
+from .scanner_local import LocalScanner
+from .scanner_remote import RemoteScanner
 from .state_db import (
     load_action_overrides,
     load_current_diffs,
     mark_paths_identical,
+    replace_diffs_in_scope,
     upsert_action_overrides,
 )
 from .tree_builder import (
@@ -158,6 +163,7 @@ class ReviewApp(ReviewActionsMixin, App[None]):
         Binding("h", "toggle_hide_identical", "Hide Identical", show=False),
         Binding("enter", "toggle_cursor_node", "Open/Close"),
         Binding("o", "open_selected", "Open", show=False),
+        Binding("U", "update_selected_path", "Update Path", show=False),
         Binding("D", "delete_selected_both", "Delete Both", show=False),
         Binding("F", "diff_selected", "Diff", show=False),
         Binding("P", "copy_selected_path", "Copy Path", show=False),
@@ -178,12 +184,14 @@ class ReviewApp(ReviewActionsMixin, App[None]):
         local_root: Path,
         remote_address: str,
         hide_identical: bool,
+        apply_settings: ApplySettings | None = None,
     ) -> None:
         super().__init__()
         self.db_path = db_path
         self.local_root = local_root
         self.remote_address = remote_address
         self.hide_identical = hide_identical
+        self.apply_settings = apply_settings or ApplySettings()
         self.status_message = ""
         self.can_apply = False
         self._pending_apply_ops: list = []
@@ -210,7 +218,10 @@ class ReviewApp(ReviewActionsMixin, App[None]):
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="body"):
-            yield Tree(_folder_label(self.root), id="tree")
+            yield Tree(
+                _folder_label(self.root, include_identical=not self.hide_identical),
+                id="tree",
+            )
             with Vertical(id="side"):
                 yield Static(id="info")
                 yield Static(id="plan")
@@ -240,7 +251,7 @@ class ReviewApp(ReviewActionsMixin, App[None]):
             if not self._visible_dir(child):
                 continue
             tree_node.add(
-                _folder_label(child),
+                _folder_label(child, include_identical=not self.hide_identical),
                 data=("dir", child.relpath),
                 allow_expand=self._dir_has_visible_children(child),
             )
@@ -261,7 +272,9 @@ class ReviewApp(ReviewActionsMixin, App[None]):
         expanded_before, selected_before = self._capture_tree_state()
         tree = self.query_one(Tree)
         tree.root.remove_children()
-        tree.root.set_label(_folder_label(self.root))
+        tree.root.set_label(
+            _folder_label(self.root, include_identical=not self.hide_identical)
+        )
         tree.root.data = ("dir", self.root.relpath)
         self._populate_node(tree.root, self.root)
         tree.root.expand()
@@ -348,6 +361,7 @@ class ReviewApp(ReviewActionsMixin, App[None]):
                 Binding("h", "toggle_hide_identical", label, show=False),
                 Binding("enter", "toggle_cursor_node", "Open/Close"),
                 Binding("o", "open_selected", "Open", show=False),
+                Binding("U", "update_selected_path", "Update Path", show=False),
                 Binding("D", "delete_selected_both", "Delete Both", show=False),
                 Binding("F", "diff_selected", "Diff", show=False),
                 Binding("P", "copy_selected_path", "Copy Path", show=False),
@@ -389,6 +403,62 @@ class ReviewApp(ReviewActionsMixin, App[None]):
             for path in self.dir_files_map.get(relpath, [])
             if path in self.files_by_relpath
         ]
+
+    def _scope_match(
+        self, relpath: str, scope_relpath: str, scope_is_dir: bool
+    ) -> bool:
+        if scope_relpath == ".":
+            return True
+        if not scope_is_dir:
+            return relpath == scope_relpath
+        prefix = f"{scope_relpath.rstrip('/')}/"
+        return relpath == scope_relpath or relpath.startswith(prefix)
+
+    def _scan_subtree_records(
+        self, scope_relpath: str, scope_is_dir: bool
+    ) -> tuple[dict[str, FileRecord], dict[str, FileRecord]]:
+        subtree = PurePosixPath(scope_relpath)
+        local_records = LocalScanner(self.local_root).scan(subtree=subtree)
+        user, host, remote_root = parse_remote_address(self.remote_address)
+        remote_records = RemoteScanner(
+            RemoteConfig(
+                host=host,
+                user=user,
+                root=remote_root,
+                state_db=f"{remote_root.rstrip('/')}/{DEFAULT_STATE_SUBPATH}",
+            )
+        ).scan(subtree=subtree)
+
+        scoped_local = {
+            relpath: record
+            for relpath, record in local_records.items()
+            if self._scope_match(relpath, scope_relpath, scope_is_dir)
+        }
+        scoped_remote = {
+            relpath: record
+            for relpath, record in remote_records.items()
+            if self._scope_match(relpath, scope_relpath, scope_is_dir)
+        }
+        return scoped_local, scoped_remote
+
+    def _replace_scope_with_diffs(
+        self, scope_relpath: str, scope_is_dir: bool, scoped_diffs: list[DiffRecord]
+    ) -> None:
+        new_diffs_by_relpath = {diff.relpath: diff for diff in scoped_diffs}
+        for relpath in list(self.diffs_by_relpath):
+            if self._scope_match(relpath, scope_relpath, scope_is_dir):
+                self.diffs_by_relpath.pop(relpath, None)
+        self.diffs_by_relpath.update(new_diffs_by_relpath)
+        self.diffs = [
+            self.diffs_by_relpath[key] for key in sorted(self.diffs_by_relpath)
+        ]
+        replace_diffs_in_scope(
+            self.db_path,
+            scoped_diffs,
+            scope_relpath=scope_relpath,
+            scope_is_dir=scope_is_dir,
+        )
+        self.action_overrides = load_action_overrides(self.db_path)
 
     def _set_info_for_dir(self, entry: DirEntry) -> None:
         c = entry.counts
@@ -757,11 +827,13 @@ def run_review_tui(
     local_root: Path,
     remote_address: str,
     hide_identical: bool,
+    apply_settings: ApplySettings | None = None,
 ) -> None:
     app = ReviewApp(
         db_path=db_path,
         local_root=local_root,
         remote_address=remote_address,
         hide_identical=hide_identical,
+        apply_settings=apply_settings,
     )
     app.run()

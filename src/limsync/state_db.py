@@ -408,3 +408,75 @@ def clear_action_overrides(db_path: Path) -> None:
             conn.execute("DELETE FROM scan_actions")
     finally:
         conn.close()
+
+
+def replace_diffs_in_scope(
+    db_path: Path,
+    diffs: list[DiffRecord],
+    *,
+    scope_relpath: str,
+    scope_is_dir: bool,
+) -> None:
+    conn = _connect(db_path)
+    try:
+        _init_schema(conn)
+        with conn:
+            if scope_is_dir:
+                scope_like = f"{normalize_text(scope_relpath).rstrip('/')}/%"
+                conn.execute(
+                    "DELETE FROM current_diffs WHERE relpath = ? OR relpath LIKE ?",
+                    (normalize_text(scope_relpath), scope_like),
+                )
+                conn.execute(
+                    "DELETE FROM scan_actions WHERE relpath = ? OR relpath LIKE ?",
+                    (normalize_text(scope_relpath), scope_like),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM current_diffs WHERE relpath = ?",
+                    (normalize_text(scope_relpath),),
+                )
+                conn.execute(
+                    "DELETE FROM scan_actions WHERE relpath = ?",
+                    (normalize_text(scope_relpath),),
+                )
+
+            conn.executemany(
+                """
+                INSERT INTO current_diffs (
+                    relpath,
+                    content_state,
+                    metadata_state,
+                    metadata_diff_json,
+                    metadata_detail_json,
+                    metadata_source,
+                    local_size,
+                    remote_size
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(relpath) DO UPDATE SET
+                    content_state = excluded.content_state,
+                    metadata_state = excluded.metadata_state,
+                    metadata_diff_json = excluded.metadata_diff_json,
+                    metadata_detail_json = excluded.metadata_detail_json,
+                    metadata_source = excluded.metadata_source,
+                    local_size = excluded.local_size,
+                    remote_size = excluded.remote_size
+                """,
+                [
+                    (
+                        normalize_text(diff.relpath),
+                        diff.content_state.value,
+                        diff.metadata_state.value,
+                        json.dumps(list(diff.metadata_diff), ensure_ascii=True),
+                        json.dumps(list(diff.metadata_details), ensure_ascii=True),
+                        normalize_text(diff.metadata_source)
+                        if diff.metadata_source is not None
+                        else None,
+                        diff.local_size,
+                        diff.remote_size,
+                    )
+                    for diff in diffs
+                ],
+            )
+    finally:
+        conn.close()

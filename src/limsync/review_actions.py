@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 
 from textual.widgets import Tree
 
+from .compare import compare_records
 from .modals import (
     ApplyRunModal,
     CommandsModal,
@@ -68,6 +69,7 @@ class ReviewActionsMixin:
                 local_root=self.local_root,
                 remote_address=self.remote_address,
                 operations=self._pending_apply_ops,
+                apply_settings=self.apply_settings,
                 progress_event_cb=self._on_apply_progress,
             ),
             callback=self._on_apply_finished,
@@ -79,17 +81,14 @@ class ReviewActionsMixin:
             self._update_plan_panel()
             return
 
-        if self._apply_newly_completed:
-            batch = set(self._apply_newly_completed)
-            self._apply_newly_completed.clear()
-            self._mark_completed_paths(batch)
+        if result.completed_paths:
+            self._mark_completed_paths(set(result.completed_paths))
 
-        remaining_ops = []
-        for relpath, required in self._apply_required_ops.items():
-            done = self._apply_done_ops.get(relpath, set())
-            for kind in required:
-                if kind not in done:
-                    remaining_ops.append(PlanOperation(kind=kind, relpath=relpath))
+        remaining_ops = [
+            op
+            for op in self._pending_apply_ops
+            if (op.kind, op.relpath) not in result.succeeded_operation_keys
+        ]
         if result.errors:
             self.status_message = (
                 f"Applied {result.succeeded_operations}/{result.total_operations} operations."
@@ -283,6 +282,31 @@ class ReviewActionsMixin:
         plan_ops = build_plan_operations(self.diffs, self.action_overrides)
         self.push_screen(PlanTreeModal(plan_ops))
 
+    def action_update_selected_path(self) -> None:
+        selected = self._selected_node()
+        if selected is None:
+            self._notify_message("Select a file or folder first.", severity="warning")
+            return
+        kind, relpath = selected
+        scope_relpath = relpath
+        scope_is_dir = kind == "dir"
+
+        try:
+            local_records, remote_records = self._scan_subtree_records(
+                scope_relpath, scope_is_dir
+            )
+            scoped_diffs = compare_records(local_records, remote_records)
+            self._replace_scope_with_diffs(scope_relpath, scope_is_dir, scoped_diffs)
+        except Exception as exc:  # noqa: BLE001
+            self._notify_message(f"Update path failed: {exc}", severity="error")
+            return
+
+        self.status_message = (
+            f"Updated path: {scope_relpath} ({len(scoped_diffs)} compared path"
+            f"{'' if len(scoped_diffs) == 1 else 's'})."
+        )
+        self._refresh_after_plan_change()
+
     def _copy_text_to_clipboard(self, text: str) -> None:
         system = platform.system()
         cmd: list[str] | None = None
@@ -391,6 +415,7 @@ class ReviewActionsMixin:
                 local_root=self.local_root,
                 remote_address=self.remote_address,
                 operations=operations,
+                apply_settings=self.apply_settings,
                 progress_event_cb=self._on_apply_progress,
             ),
             callback=self._on_delete_finished,

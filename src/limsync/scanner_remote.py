@@ -19,6 +19,7 @@ class RemoteScanner:
     def scan(
         self,
         progress_cb: Callable[[PurePosixPath, int, int], None] | None = None,
+        subtree: PurePosixPath | None = None,
     ) -> dict[str, FileRecord]:
         client = paramiko.SSHClient()
         client.load_system_host_keys()
@@ -46,6 +47,8 @@ class RemoteScanner:
                 f"--state-db {shlex.quote(self.config.state_db)} "
                 "--progress-interval 0.2"
             )
+            if subtree is not None and str(subtree) not in {"", "."}:
+                command += f" --subtree {shlex.quote(subtree.as_posix())}"
             stdin, stdout, stderr = client.exec_command(command)
             stdin.write(helper_source)
             stdin.channel.shutdown_write()
