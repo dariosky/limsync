@@ -82,6 +82,16 @@ class RemoteScanner:
                         size=int(event.get("size", 0)),
                         mtime_ns=int(event.get("mtime_ns", 0)),
                         mode=int(event.get("mode", 0)),
+                        link_target=(
+                            str(event["link_target"])
+                            if event.get("link_target") is not None
+                            else None
+                        ),
+                        link_target_key=(
+                            str(event["link_target_key"])
+                            if event.get("link_target_key") is not None
+                            else None
+                        ),
                         owner=None,
                         group=None,
                     )

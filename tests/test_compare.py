@@ -102,12 +102,28 @@ def test_directory_metadata_can_drift_but_content_identical() -> None:
     assert diff.metadata_state == MetadataState.DIFFERENT
 
 
-def test_symlink_metadata_is_ignored() -> None:
+def test_symlink_content_uses_normalized_target_key() -> None:
     local = {
-        "l": mk_file("l", node_type=NodeType.SYMLINK, mode=0o777, mtime_ns=1, size=3)
+        "l": mk_file(
+            "l",
+            node_type=NodeType.SYMLINK,
+            mode=0o777,
+            mtime_ns=1,
+            size=3,
+            link_target="/Users/dario.varotto/Dropbox/docs/readme.md",
+            link_target_key="inroot:docs/readme.md",
+        )
     }
     remote = {
-        "l": mk_file("l", node_type=NodeType.SYMLINK, mode=0o600, mtime_ns=10, size=3)
+        "l": mk_file(
+            "l",
+            node_type=NodeType.SYMLINK,
+            mode=0o600,
+            mtime_ns=10,
+            size=3,
+            link_target="../docs/readme.md",
+            link_target_key="inroot:docs/readme.md",
+        )
     }
 
     diff = compare_records(local, remote, mtime_tolerance_ns=0)[0]
@@ -115,3 +131,26 @@ def test_symlink_metadata_is_ignored() -> None:
     assert diff.metadata_state == MetadataState.NOT_APPLICABLE
     assert diff.metadata_diff == ()
     assert diff.metadata_source is None
+
+
+def test_symlink_with_different_target_is_different_content() -> None:
+    local = {
+        "l": mk_file(
+            "l",
+            node_type=NodeType.SYMLINK,
+            link_target="docs/a.txt",
+            link_target_key="inroot:docs/a.txt",
+        )
+    }
+    remote = {
+        "l": mk_file(
+            "l",
+            node_type=NodeType.SYMLINK,
+            link_target="docs/b.txt",
+            link_target_key="inroot:docs/b.txt",
+        )
+    }
+
+    diff = compare_records(local, remote, mtime_tolerance_ns=0)[0]
+    assert diff.content_state == ContentState.DIFFERENT
+    assert diff.metadata_state == MetadataState.NOT_APPLICABLE

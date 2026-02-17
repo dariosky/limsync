@@ -109,12 +109,17 @@ def compare_records(
         metadata_source = _preferred_metadata_source(local, remote, metadata_diff)
 
         if local.node_type == NodeType.SYMLINK:
-            # Symlink metadata (mode/mtime) is often unstable across platforms.
-            # Treat symlinks as metadata-insensitive to avoid recurring drift noise.
+            local_target = local.link_target_key or local.link_target
+            remote_target = remote.link_target_key or remote.link_target
+            same_symlink_target = local_target == remote_target
             diffs.append(
                 DiffRecord(
                     relpath=relpath,
-                    content_state=ContentState.IDENTICAL,
+                    content_state=(
+                        ContentState.IDENTICAL
+                        if same_symlink_target
+                        else ContentState.DIFFERENT
+                    ),
                     metadata_state=MetadataState.NOT_APPLICABLE,
                     metadata_diff=(),
                     metadata_details=(),

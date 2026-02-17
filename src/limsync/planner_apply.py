@@ -12,6 +12,7 @@ from pathlib import Path
 import paramiko
 
 from .models import ContentState, DiffRecord, MetadataState
+from .symlink_utils import map_symlink_target_for_destination
 
 ACTION_LEFT_WINS = "left_wins"
 ACTION_RIGHT_WINS = "right_wins"
@@ -266,6 +267,28 @@ def _remote_expand_root(client: paramiko.SSHClient, root: str) -> str:
     raise RuntimeError(f"Failed to resolve remote root {root!r}: {err}")
 
 
+def _remote_expand_home(client: paramiko.SSHClient) -> str:
+    command = "python3 -c \"import os; print(os.path.expanduser('~'))\""
+    _stdin, stdout, stderr = client.exec_command(command)
+    out = stdout.read().decode("utf-8", errors="replace").strip()
+    err = stderr.read().decode("utf-8", errors="replace").strip()
+    if out:
+        return out
+    raise RuntimeError(f"Failed to resolve remote home: {err}")
+
+
+def _unlink_local_if_exists(path: Path) -> None:
+    if path.is_symlink() or path.exists():
+        path.unlink()
+
+
+def _remove_remote_if_exists(sftp: paramiko.SFTPClient, path: str) -> None:
+    try:
+        sftp.remove(path)
+    except OSError:
+        return
+
+
 def execute_plan(
     local_root: Path,
     remote_address: str,
@@ -274,6 +297,8 @@ def execute_plan(
     | None = None,
     settings: ApplySettings | None = None,
 ) -> ExecuteResult:
+    local_root = local_root.expanduser().resolve()
+    local_home = Path.home().expanduser().resolve()
     resolved_settings = settings or ApplySettings()
     if not operations:
         return ExecuteResult(
@@ -312,6 +337,10 @@ def execute_plan(
 
     try:
         remote_root = _remote_expand_root(client, remote_root_raw)
+        try:
+            remote_home = _remote_expand_home(client)
+        except Exception:
+            remote_home = f"/home/{user}"
         sftp = client.open_sftp()
         normalized_remote_root = remote_root.rstrip("/") or "/"
         known_remote_dirs: set[str] = {"/", normalized_remote_root}
@@ -327,7 +356,7 @@ def execute_plan(
 
                 try:
                     if op.kind == "copy_right":
-                        if not local_path.exists():
+                        if not (local_path.exists() or local_path.is_symlink()):
                             raise FileNotFoundError(
                                 f"missing local source: {local_path}"
                             )
@@ -337,22 +366,51 @@ def execute_plan(
                             remote_path,
                             known_dirs=known_remote_dirs,
                         )
-                        sftp.put(
-                            str(local_path),
-                            remote_path,
-                            confirm=resolved_settings.sftp_put_confirm,
-                        )
-                        _apply_remote_metadata_from_local(
-                            sftp, remote_path, source_local_stat
-                        )
+                        if stat.S_ISLNK(source_local_stat.st_mode):
+                            source_target = os.readlink(local_path)
+                            mapped_target = map_symlink_target_for_destination(
+                                source_root=local_root,
+                                source_home=local_home,
+                                source_relpath=relpath,
+                                source_target=source_target,
+                                destination_root=Path(remote_root),
+                                destination_home=Path(remote_home),
+                                destination_relpath=relpath,
+                            )
+                            _remove_remote_if_exists(sftp, remote_path)
+                            sftp.symlink(mapped_target, remote_path)
+                        else:
+                            sftp.put(
+                                str(local_path),
+                                remote_path,
+                                confirm=resolved_settings.sftp_put_confirm,
+                            )
+                            _apply_remote_metadata_from_local(
+                                sftp, remote_path, source_local_stat
+                            )
                         ok = True
                     elif op.kind == "copy_left":
-                        source_remote_stat = sftp.stat(remote_path)
+                        source_remote_lstat = sftp.lstat(remote_path)
                         _ensure_local_parent(local_path)
-                        sftp.get(remote_path, str(local_path))
-                        _apply_local_metadata_from_remote(
-                            local_path, source_remote_stat
-                        )
+                        if stat.S_ISLNK(getattr(source_remote_lstat, "st_mode", 0)):
+                            source_target = sftp.readlink(remote_path)
+                            mapped_target = map_symlink_target_for_destination(
+                                source_root=Path(remote_root),
+                                source_home=Path(remote_home),
+                                source_relpath=relpath,
+                                source_target=source_target,
+                                destination_root=local_root,
+                                destination_home=local_home,
+                                destination_relpath=relpath,
+                            )
+                            _unlink_local_if_exists(local_path)
+                            os.symlink(mapped_target, local_path)
+                        else:
+                            source_remote_stat = sftp.stat(remote_path)
+                            sftp.get(remote_path, str(local_path))
+                            _apply_local_metadata_from_remote(
+                                local_path, source_remote_stat
+                            )
                         ok = True
                     elif op.kind == "delete_right":
                         sftp.remove(remote_path)

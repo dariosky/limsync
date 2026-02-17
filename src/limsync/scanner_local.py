@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath
 
 from .excludes import IgnoreRules, is_excluded_file_name, is_excluded_folder_name
 from .models import FileRecord, NodeType
+from .symlink_utils import symlink_target_compare_key
 from .text_utils import normalize_text
 
 
@@ -22,6 +23,7 @@ def _node_type(st_mode: int) -> NodeType:
 class LocalScanner:
     def __init__(self, root: Path) -> None:
         self.root = root.expanduser().resolve()
+        self.home = Path.home().expanduser().resolve()
 
     def scan(
         self,
@@ -90,12 +92,24 @@ class LocalScanner:
                 files_seen += 1
 
                 relpath = normalize_text(child_rel.as_posix())
+                link_target = None
+                link_target_key = None
+                if node_type == NodeType.SYMLINK:
+                    link_target = normalize_text(os.readlink(full_path))
+                    link_target_key = symlink_target_compare_key(
+                        relpath=relpath,
+                        target=link_target,
+                        root=self.root,
+                        home=self.home,
+                    )
                 records[relpath] = FileRecord(
                     relpath=relpath,
                     node_type=node_type,
                     size=st.st_size,
                     mtime_ns=st.st_mtime_ns,
                     mode=stat.S_IMODE(st.st_mode),
+                    link_target=link_target,
+                    link_target_key=link_target_key,
                     owner=None,
                     group=None,
                 )

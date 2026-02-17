@@ -20,6 +20,8 @@ def mk_file(
     size: int = 0,
     mtime_ns: int = 0,
     mode: int = 0o644,
+    link_target: str | None = None,
+    link_target_key: str | None = None,
 ) -> FileRecord:
     return FileRecord(
         relpath=relpath,
@@ -27,6 +29,8 @@ def mk_file(
         size=size,
         mtime_ns=mtime_ns,
         mode=mode,
+        link_target=link_target,
+        link_target_key=link_target_key,
     )
 
 
@@ -71,6 +75,7 @@ class RemoteStat:
 class FakeSFTPClient:
     def __init__(self) -> None:
         self.remote_files: dict[str, bytes] = {}
+        self.remote_symlinks: dict[str, str] = {}
         self.remote_stats: dict[str, RemoteStat] = {}
         self.remote_lstats: dict[str, RemoteStat] = {}
         self.existing_dirs: set[str] = {"/"}
@@ -88,6 +93,8 @@ class FakeSFTPClient:
     def stat(self, path: str):
         self._check_failure("stat", path)
         self.calls.append(("stat", path))
+        if path in self.remote_symlinks:
+            return self.remote_stats.get(path, RemoteStat(st_mode=0o100644, st_atime=1.0, st_mtime=1.0))
         if path in self.remote_stats:
             return self.remote_stats[path]
         if path in self.existing_dirs:
@@ -97,6 +104,8 @@ class FakeSFTPClient:
     def lstat(self, path: str):
         self._check_failure("lstat", path)
         self.calls.append(("lstat", path))
+        if path in self.remote_symlinks:
+            return self.remote_lstats.get(path, RemoteStat(st_mode=0o120777, st_atime=1.0, st_mtime=1.0))
         if path in self.remote_lstats:
             return self.remote_lstats[path]
         return self.stat(path)
@@ -110,6 +119,7 @@ class FakeSFTPClient:
         self._check_failure("put", remote_path)
         self.calls.append(("put", local_path, remote_path, confirm))
         data = Path(local_path).read_bytes()
+        self.remote_symlinks.pop(remote_path, None)
         self.remote_files[remote_path] = data
         self.remote_stats.setdefault(remote_path, self._default_file_stat())
 
@@ -120,11 +130,31 @@ class FakeSFTPClient:
             raise FileNotFoundError(f"remote missing: {remote_path}")
         Path(local_path).write_bytes(self.remote_files[remote_path])
 
+    def symlink(self, target_path: str, path: str) -> None:
+        self._check_failure("symlink", path)
+        self.calls.append(("symlink", target_path, path))
+        self.remote_files.pop(path, None)
+        self.remote_symlinks[path] = target_path
+        self.remote_lstats[path] = RemoteStat(st_mode=0o120777, st_atime=1.0, st_mtime=1.0)
+        self.remote_stats[path] = RemoteStat(st_mode=0o100644, st_atime=1.0, st_mtime=1.0)
+
+    def readlink(self, path: str) -> str:
+        self._check_failure("readlink", path)
+        self.calls.append(("readlink", path))
+        if path not in self.remote_symlinks:
+            raise FileNotFoundError(f"remote symlink missing: {path}")
+        return self.remote_symlinks[path]
+
     def remove(self, remote_path: str) -> None:
         self._check_failure("remove", remote_path)
         self.calls.append(("remove", remote_path))
         if remote_path in self.remote_files:
             del self.remote_files[remote_path]
+            self.remote_stats.pop(remote_path, None)
+            self.remote_lstats.pop(remote_path, None)
+            return
+        if remote_path in self.remote_symlinks:
+            del self.remote_symlinks[remote_path]
             self.remote_stats.pop(remote_path, None)
             self.remote_lstats.pop(remote_path, None)
             return

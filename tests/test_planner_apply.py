@@ -202,6 +202,35 @@ def test_execute_plan_copy_right_and_delete_right(tmp_path, monkeypatch) -> None
     assert progress[-1][1] == 2
 
 
+def test_execute_plan_copy_right_symlink_rewrites_in_root_target(tmp_path, monkeypatch) -> None:
+    local_root = tmp_path / "local"
+    (local_root / "docs").mkdir(parents=True)
+    (local_root / "nested").mkdir(parents=True)
+    (local_root / "docs" / "x.txt").write_text("x", encoding="utf-8")
+    (local_root / "nested" / "link").symlink_to(str(local_root / "docs" / "x.txt"))
+
+    sftp = FakeSFTPClient()
+    sftp.existing_dirs.add("/remote")
+    ssh = FakeSSHClient(sftp)
+
+    from limsync import planner_apply as pa
+
+    monkeypatch.setattr(pa.paramiko, "SSHClient", lambda: ssh)
+    monkeypatch.setattr(pa.paramiko, "AutoAddPolicy", DummyAutoAddPolicy)
+    monkeypatch.setattr(pa, "_remote_expand_root", lambda _client, _root: "/remote")
+    monkeypatch.setattr(pa, "_remote_expand_home", lambda _client: "/home/dario")
+
+    result = execute_plan(
+        local_root,
+        "u@h:~/x",
+        [PlanOperation("copy_right", "nested/link")],
+    )
+
+    assert result.errors == []
+    assert result.succeeded_operations == 1
+    assert sftp.remote_symlinks["/remote/nested/link"] == "../docs/x.txt"
+
+
 def test_ensure_remote_parent_cached_reuses_known_dirs() -> None:
     sftp = FakeSFTPClient()
     sftp.existing_dirs.update({"/remote"})
@@ -257,6 +286,69 @@ def test_execute_plan_copy_left_and_delete_left(tmp_path, monkeypatch) -> None:
     assert not to_delete.exists()
     assert result.total_operations == 2
     assert result.succeeded_operations == 2
+
+
+def test_execute_plan_copy_left_symlink_rewrites_in_root_target(tmp_path, monkeypatch) -> None:
+    local_root = tmp_path / "local"
+    (local_root / "nested").mkdir(parents=True)
+
+    sftp = FakeSFTPClient()
+    sftp.existing_dirs.add("/remote")
+    sftp.remote_symlinks["/remote/nested/link"] = "/remote/docs/x.txt"
+    sftp.remote_lstats["/remote/nested/link"] = make_remote_stat(
+        mode=stat.S_IFLNK | 0o777, atime=1.0, mtime=1.0
+    )
+    ssh = FakeSSHClient(sftp)
+
+    from limsync import planner_apply as pa
+
+    monkeypatch.setattr(pa.paramiko, "SSHClient", lambda: ssh)
+    monkeypatch.setattr(pa.paramiko, "AutoAddPolicy", DummyAutoAddPolicy)
+    monkeypatch.setattr(pa, "_remote_expand_root", lambda _client, _root: "/remote")
+    monkeypatch.setattr(pa, "_remote_expand_home", lambda _client: "/home/dario")
+
+    result = execute_plan(
+        local_root,
+        "u@h:~/x",
+        [PlanOperation("copy_left", "nested/link")],
+    )
+
+    assert result.errors == []
+    assert result.succeeded_operations == 1
+    link = local_root / "nested" / "link"
+    assert link.is_symlink()
+    assert os.readlink(link) == "../docs/x.txt"
+
+
+def test_execute_plan_copy_left_symlink_rewrites_home_prefix(tmp_path, monkeypatch) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+
+    sftp = FakeSFTPClient()
+    sftp.existing_dirs.add("/remote")
+    sftp.remote_symlinks["/remote/link"] = "/home/dario/Outside/file.txt"
+    sftp.remote_lstats["/remote/link"] = make_remote_stat(
+        mode=stat.S_IFLNK | 0o777, atime=1.0, mtime=1.0
+    )
+    ssh = FakeSSHClient(sftp)
+
+    from limsync import planner_apply as pa
+
+    monkeypatch.setattr(pa.paramiko, "SSHClient", lambda: ssh)
+    monkeypatch.setattr(pa.paramiko, "AutoAddPolicy", DummyAutoAddPolicy)
+    monkeypatch.setattr(pa, "_remote_expand_root", lambda _client, _root: "/remote")
+    monkeypatch.setattr(pa, "_remote_expand_home", lambda _client: "/home/dario")
+
+    result = execute_plan(
+        local_root,
+        "u@h:~/x",
+        [PlanOperation("copy_left", "link")],
+    )
+
+    assert result.errors == []
+    assert result.succeeded_operations == 1
+    expected = str(Path.home().expanduser().resolve() / "Outside" / "file.txt")
+    assert os.readlink(local_root / "link") == expected
 
 
 def test_execute_plan_put_uses_confirm_false_by_default(tmp_path, monkeypatch) -> None:

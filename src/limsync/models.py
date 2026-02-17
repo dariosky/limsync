@@ -31,6 +31,8 @@ class FileRecord:
     size: int
     mtime_ns: int
     mode: int
+    link_target: str | None = None
+    link_target_key: str | None = None
     owner: str | None = None
     group: str | None = None
 

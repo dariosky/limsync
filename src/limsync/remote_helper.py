@@ -134,6 +134,37 @@ def node_type(st_mode: int) -> str:
     return "file"
 
 
+def _symlink_target_compare_key(
+    root: str, home: str, relpath: str, target: str | None
+) -> str | None:
+    if target is None:
+        return None
+
+    normalized = PurePosixPath(target).as_posix()
+    if os.path.isabs(normalized):
+        abs_target = os.path.normpath(normalized)
+    else:
+        abs_target = os.path.normpath(
+            os.path.join(root, os.path.dirname(relpath), normalized)
+        )
+
+    rel_to_root = os.path.relpath(abs_target, root)
+    if rel_to_root == ".":
+        return "inroot:."
+    if not rel_to_root.startswith("../"):
+        return f"inroot:{PurePosixPath(rel_to_root).as_posix()}"
+
+    if os.path.isabs(normalized):
+        rel_to_home = os.path.relpath(abs_target, home)
+        if rel_to_home == ".":
+            return "home:."
+        if not rel_to_home.startswith("../"):
+            return f"home:{PurePosixPath(rel_to_home).as_posix()}"
+        return f"abs:{PurePosixPath(abs_target).as_posix()}"
+
+    return f"rel:{normalized}"
+
+
 def update_state_db(
     state_db: str,
     root: str,
@@ -246,6 +277,7 @@ def run_scan(
 ) -> int:
     root = os.path.expanduser(root_arg)
     root = os.path.abspath(root)
+    home = os.path.abspath(os.path.expanduser("~"))
     if not os.path.isdir(root):
         emit({"event": "error", "message": f"Root not found: {root}"})
         return 2
@@ -354,6 +386,17 @@ def run_scan(
 
             relpath = child_rel.as_posix()
             files_seen += 1
+            link_target = None
+            link_target_key = None
+            if ntype == "symlink":
+                try:
+                    link_target = PurePosixPath(os.readlink(full_path)).as_posix()
+                    link_target_key = _symlink_target_compare_key(
+                        root, home, relpath, link_target
+                    )
+                except OSError:
+                    link_target = None
+                    link_target_key = None
             record = {
                 "event": "record",
                 "relpath": relpath,
@@ -361,6 +404,8 @@ def run_scan(
                 "size": int(st.st_size),
                 "mtime_ns": int(st.st_mtime_ns),
                 "mode": int(stat.S_IMODE(st.st_mode)),
+                "link_target": link_target,
+                "link_target_key": link_target_key,
                 "owner": None,
                 "group": None,
             }
