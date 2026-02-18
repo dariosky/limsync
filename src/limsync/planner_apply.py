@@ -12,6 +12,7 @@ from pathlib import Path
 import paramiko
 
 from .models import ContentState, DiffRecord, MetadataState
+from .ssh_pool import pooled_ssh_client
 from .symlink_utils import map_symlink_target_for_destination
 
 ACTION_LEFT_WINS = "left_wins"
@@ -313,19 +314,6 @@ def execute_plan(
     for op in operations:
         path_ops.setdefault(op.relpath, []).append(op)
 
-    client = paramiko.SSHClient()
-    client.load_system_host_keys()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=host,
-        username=user,
-        port=22,
-        look_for_keys=True,
-        allow_agent=True,
-        timeout=10,
-        compress=resolved_settings.ssh_compression,
-    )
-
     errors: list[str] = []
     succeeded: set[tuple[str, str]] = set()
     attempted: set[tuple[str, str]] = set()
@@ -335,7 +323,15 @@ def execute_plan(
     op_seconds: dict[str, float] = {}
     metadata_context_cache: dict[str, tuple[os.stat_result, object, set[str]]] = {}
 
-    try:
+    with pooled_ssh_client(
+        host=host,
+        user=user,
+        port=22,
+        compress=resolved_settings.ssh_compression,
+        timeout=10,
+        client_factory=paramiko.SSHClient,
+        auto_add_policy_factory=paramiko.AutoAddPolicy,
+    ) as client:
         remote_root = _remote_expand_root(client, remote_root_raw)
         try:
             remote_home = _remote_expand_home(client)
@@ -510,8 +506,6 @@ def execute_plan(
 
         finally:
             sftp.close()
-    finally:
-        client.close()
 
     completed_paths: set[str] = set()
     for relpath, path_operations in path_ops.items():

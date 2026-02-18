@@ -26,6 +26,7 @@ from .planner_apply import (
 from .review_actions import ReviewActionsMixin
 from .scanner_local import LocalScanner
 from .scanner_remote import RemoteScanner
+from .ssh_pool import pooled_ssh_client
 from .state_db import (
     load_action_overrides,
     load_current_diffs,
@@ -578,45 +579,43 @@ class ReviewApp(ReviewActionsMixin, App[None]):
         target = self._open_temp_dir / relpath
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        client = paramiko.SSHClient()
-        client.load_system_host_keys()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            hostname=host,
-            username=user,
+        with pooled_ssh_client(
+            host=host,
+            user=user,
             port=22,
-            look_for_keys=True,
-            allow_agent=True,
+            compress=self.apply_settings.ssh_compression,
             timeout=10,
-        )
-        sftp = client.open_sftp()
-        try:
-            # Expand ~ on remote shell, then resolve via SFTP.
-            quoted = remote_root.replace("'", "'\\''")
-            _stdin, stdout, _stderr = client.exec_command(
-                f"python3 -c \"import os; print(os.path.expanduser('{quoted}'))\""
-            )
-            expanded = (
-                stdout.read().decode("utf-8", errors="replace").strip() or remote_root
-            )
-            remote_root_abs = sftp.normalize(expanded)
-
-            last_error: Exception | None = None
-            for rel_candidate in self._candidate_relpaths(relpath):
-                remote_path = str(
-                    PurePosixPath(remote_root_abs) / PurePosixPath(rel_candidate)
+            client_factory=paramiko.SSHClient,
+            auto_add_policy_factory=paramiko.AutoAddPolicy,
+        ) as client:
+            sftp = client.open_sftp()
+            try:
+                # Expand ~ on remote shell, then resolve via SFTP.
+                quoted = remote_root.replace("'", "'\\''")
+                _stdin, stdout, _stderr = client.exec_command(
+                    f"python3 -c \"import os; print(os.path.expanduser('{quoted}'))\""
                 )
-                try:
-                    sftp.get(remote_path, str(target))
-                    return target
-                except Exception as exc:  # noqa: BLE001
-                    last_error = exc
-                    continue
-            if last_error is not None:
-                raise last_error
-        finally:
-            sftp.close()
-            client.close()
+                expanded = (
+                    stdout.read().decode("utf-8", errors="replace").strip()
+                    or remote_root
+                )
+                remote_root_abs = sftp.normalize(expanded)
+
+                last_error: Exception | None = None
+                for rel_candidate in self._candidate_relpaths(relpath):
+                    remote_path = str(
+                        PurePosixPath(remote_root_abs) / PurePosixPath(rel_candidate)
+                    )
+                    try:
+                        sftp.get(remote_path, str(target))
+                        return target
+                    except Exception as exc:  # noqa: BLE001
+                        last_error = exc
+                        continue
+                if last_error is not None:
+                    raise last_error
+            finally:
+                sftp.close()
         return target
 
     def _has_local_copy(self, relpath: str) -> bool:

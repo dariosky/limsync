@@ -9,6 +9,7 @@ import paramiko
 
 from .config import RemoteConfig
 from .models import FileRecord, NodeType
+from .ssh_pool import pooled_ssh_client
 from .text_utils import normalize_text
 
 
@@ -21,23 +22,19 @@ class RemoteScanner:
         progress_cb: Callable[[PurePosixPath, int, int], None] | None = None,
         subtree: PurePosixPath | None = None,
     ) -> dict[str, FileRecord]:
-        client = paramiko.SSHClient()
-        client.load_system_host_keys()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(
-            hostname=self.config.host,
-            username=self.config.user,
-            port=self.config.port,
-            look_for_keys=True,
-            allow_agent=True,
-            timeout=10,
-        )
-
         records: dict[str, FileRecord] = {}
         done_payload: dict[str, object] | None = None
         error_messages: list[str] = []
 
-        try:
+        with pooled_ssh_client(
+            host=self.config.host,
+            user=self.config.user,
+            port=self.config.port,
+            compress=False,
+            timeout=10,
+            client_factory=paramiko.SSHClient,
+            auto_add_policy_factory=paramiko.AutoAddPolicy,
+        ) as client:
             helper_source = (
                 Path(__file__).with_name("remote_helper.py").read_text(encoding="utf-8")
             )
@@ -132,5 +129,3 @@ class RemoteScanner:
                 )
 
             return records
-        finally:
-            client.close()

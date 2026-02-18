@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from limsync.models import (
     ContentState,
     DiffRecord,
@@ -11,6 +13,14 @@ from limsync.models import (
     MetadataState,
     NodeType,
 )
+from limsync.ssh_pool import close_ssh_pool
+
+
+@pytest.fixture(autouse=True)
+def _reset_ssh_pool_between_tests():
+    close_ssh_pool()
+    yield
+    close_ssh_pool()
 
 
 def mk_file(
