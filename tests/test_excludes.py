@@ -8,6 +8,7 @@ from limsync.excludes import (
     is_excluded_folder_name,
     load_ignore_rules_tree,
 )
+from limsync.remote_helper import IgnoreRules as RemoteIgnoreRules
 
 
 def test_name_based_exclusions() -> None:
@@ -67,10 +68,31 @@ def test_load_tree_skips_excluded_folders(tmp_path) -> None:
 
     rules = load_ignore_rules_tree(root)
 
-    assert "." in rules._specs
-    assert "node_modules" not in rules._specs
+    assert "." in rules._patterns
+    assert "node_modules" not in rules._patterns
 
 
 def test_load_tree_missing_root_returns_empty_rules(tmp_path) -> None:
     rules = load_ignore_rules_tree(tmp_path / "missing")
-    assert rules._specs == {}
+    assert rules._patterns == {}
+
+
+def test_remote_and_local_ignore_rules_match_behavior() -> None:
+    local = IgnoreRules()
+    remote = RemoteIgnoreRules()
+    lines = ["*.tmp", "!keep.tmp", "build/", "/root-only.txt"]
+    local.add_spec(PurePosixPath("."), lines)
+    remote.add_spec(PurePosixPath("."), lines)
+
+    checks = [
+        (PurePosixPath("a.tmp"), False),
+        (PurePosixPath("keep.tmp"), False),
+        (PurePosixPath("x/build"), True),
+        (PurePosixPath("x/build/nested.txt"), False),
+        (PurePosixPath("root-only.txt"), False),
+        (PurePosixPath("x/root-only.txt"), False),
+    ]
+    for relpath, is_dir in checks:
+        assert local.is_ignored(relpath, is_dir=is_dir) == remote.is_ignored(
+            relpath, is_dir=is_dir
+        )

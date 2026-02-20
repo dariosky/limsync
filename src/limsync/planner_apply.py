@@ -25,6 +25,8 @@ ACTION_RIGHT_WINS = "right_wins"
 ACTION_IGNORE = "ignore"
 ACTION_SUGGESTED = "suggested"
 
+type StatLike = os.stat_result | paramiko.SFTPAttributes
+
 
 @dataclass(frozen=True)
 class PlanOperation:
@@ -256,11 +258,11 @@ def _join_remote(root: str, relpath: str) -> str:
     return f"{root.rstrip('/')}/{relpath}"
 
 
-def _remote_mtime_ns(st: object) -> int:
+def _remote_mtime_ns(st: StatLike) -> int:
     return int(float(getattr(st, "st_mtime", 0)) * 1_000_000_000)
 
 
-def _remote_atime_ns(st: object) -> int:
+def _remote_atime_ns(st: StatLike) -> int:
     return int(float(getattr(st, "st_atime", 0)) * 1_000_000_000)
 
 
@@ -283,7 +285,7 @@ def _apply_remote_metadata_from_local(
 def _apply_remote_metadata_from_remote(
     sftp: paramiko.SFTPClient,
     remote_path: str,
-    remote_stat: object,
+    remote_stat: StatLike,
 ) -> None:
     mode = stat.S_IMODE(getattr(remote_stat, "st_mode", 0))
     sftp.chmod(remote_path, mode)
@@ -298,7 +300,7 @@ def _apply_remote_metadata_from_remote(
 
 def _apply_local_metadata_from_remote(
     local_path: Path,
-    remote_stat: object,
+    remote_stat: StatLike,
 ) -> None:
     mode = stat.S_IMODE(getattr(remote_stat, "st_mode", 0))
     os.chmod(local_path, mode)
@@ -425,7 +427,7 @@ def _side_path(side: _SideRuntime, relpath: str) -> Path | str:
     return _join_remote(side.remote.root, relpath)
 
 
-def _side_lstat(side: _SideRuntime, relpath: str) -> object:
+def _side_lstat(side: _SideRuntime, relpath: str) -> StatLike:
     if side.is_local:
         path = _side_path(side, relpath)
         assert isinstance(path, Path)
@@ -436,7 +438,7 @@ def _side_lstat(side: _SideRuntime, relpath: str) -> object:
     return side.remote.sftp.lstat(path)
 
 
-def _side_stat(side: _SideRuntime, relpath: str) -> object:
+def _side_stat(side: _SideRuntime, relpath: str) -> StatLike:
     if side.is_local:
         path = _side_path(side, relpath)
         assert isinstance(path, Path)
@@ -511,17 +513,17 @@ def _side_ensure_parent(
     _ensure_remote_parent_cached(side.remote.sftp, path, known_dirs=known_remote_dirs)
 
 
-def _local_mode(st_obj: object) -> int:
+def _local_mode(st_obj: StatLike) -> int:
     return stat.S_IMODE(getattr(st_obj, "st_mode", 0))
 
 
-def _local_mtime_ns(st_obj: object) -> int:
+def _local_mtime_ns(st_obj: StatLike) -> int:
     if hasattr(st_obj, "st_mtime_ns"):
         return int(getattr(st_obj, "st_mtime_ns"))
     return _remote_mtime_ns(st_obj)
 
 
-def _is_symlink(st_obj: object) -> bool:
+def _is_symlink(st_obj: StatLike) -> bool:
     return stat.S_ISLNK(getattr(st_obj, "st_mode", 0))
 
 

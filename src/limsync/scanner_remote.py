@@ -31,9 +31,7 @@ class RemoteScanner:
             compress=False,
             timeout=10,
         ) as client:
-            helper_source = (
-                Path(__file__).with_name("remote_helper.py").read_text(encoding="utf-8")
-            )
+            helper_source = self._remote_helper_source()
             command = (
                 "python3 -u - "
                 f"--root {shlex.quote(self.config.root)} "
@@ -125,3 +123,20 @@ class RemoteScanner:
                 )
 
             return records
+
+    def _remote_helper_source(self) -> str:
+        helper_source = (
+            Path(__file__).with_name("remote_helper.py").read_text(encoding="utf-8")
+        )
+        marker = "# [[IGNORE_RULES_SHARED]]"
+        if marker not in helper_source:
+            return helper_source
+        shared_source = (
+            Path(__file__)
+            .with_name("ignore_rules_shared.py")
+            .read_text(encoding="utf-8")
+        )
+        indented = "\n".join(
+            f"    {line}" if line else "" for line in shared_source.splitlines()
+        )
+        return helper_source.replace(marker, indented)
