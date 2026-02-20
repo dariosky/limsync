@@ -7,6 +7,7 @@ from datetime import UTC, datetime
 import pytest
 
 from limsync.compare import compare_records
+from limsync.deletion_intent import apply_intentional_deletion_hints
 from limsync.models import ContentState, MetadataState
 from limsync.planner_apply import ACTION_SUGGESTED, build_plan_operations
 from limsync.scanner_local import LocalScanner
@@ -56,8 +57,8 @@ def analyze_scenario(
     suggested_ops = build_plan_operations(diffs, suggested_overrides)
 
     return ScenarioResult(
-        left=sum(1 for diff in diffs if diff.content_state == ContentState.ONLY_LOCAL),
-        right=sum(1 for diff in diffs if diff.content_state == ContentState.ONLY_REMOTE),
+        left=sum(1 for diff in diffs if diff.content_state == ContentState.ONLY_LEFT),
+        right=sum(1 for diff in diffs if diff.content_state == ContentState.ONLY_RIGHT),
         conflicts=sum(
             1 for diff in diffs if diff.content_state == ContentState.DIFFERENT
         ),
@@ -69,6 +70,20 @@ def analyze_scenario(
         ),
         suggested_actions=sorted((op.kind, op.relpath) for op in suggested_ops),
     )
+
+
+def _write_side(
+    tmp_path,
+    side_name: str,
+    files: dict[str, str],
+):
+    root = tmp_path / side_name
+    root.mkdir()
+    for relpath, content in files.items():
+        path = root / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    return root
 
 
 def test_counts_and_suggested_actions_for_two_one_sided_files(
@@ -146,22 +161,26 @@ def test_counts_and_suggested_actions_for_content_conflict(
 def test_asymmetric_dropboxignore_between_trees(
     tmp_path, ts_2026_02_19_midnight_ns
 ) -> None:
-    left_root = tmp_path / "left"
-    right_root = tmp_path / "right"
-    left_root.mkdir()
-    right_root.mkdir()
-
-    (left_root / "a.txt").write_text("same-a\n", encoding="utf-8")
-    (right_root / "a.txt").write_text("same-a\n", encoding="utf-8")
-
-    (left_root / "b.txt").write_text("same-b\n", encoding="utf-8")
-    (right_root / "b.txt").write_text("same-b\n", encoding="utf-8")
-
-    (left_root / "c.txt").write_text("same-c\n", encoding="utf-8")
-    (right_root / "c.txt").write_text("same-c\n", encoding="utf-8")
-
-    (left_root / ".dropboxignore").write_text("b.txt\n", encoding="utf-8")
-    (right_root / ".dropboxignore").write_text("c.txt\n# extra\n", encoding="utf-8")
+    left_root = _write_side(
+        tmp_path,
+        "left",
+        {
+            "a.txt": "same-a\n",
+            "b.txt": "same-b\n",
+            "c.txt": "same-c\n",
+            ".dropboxignore": "b.txt\n",
+        },
+    )
+    right_root = _write_side(
+        tmp_path,
+        "right",
+        {
+            "a.txt": "same-a\n",
+            "b.txt": "same-b\n",
+            "c.txt": "same-c\n",
+            ".dropboxignore": "c.txt\n# extra\n",
+        },
+    )
 
     os.utime(
         left_root / "a.txt",
@@ -179,8 +198,8 @@ def test_asymmetric_dropboxignore_between_trees(
 
     assert by["a.txt"].content_state == ContentState.IDENTICAL
     assert by[".dropboxignore"].content_state == ContentState.DIFFERENT
-    assert by["c.txt"].content_state == ContentState.ONLY_LOCAL
-    assert by["b.txt"].content_state == ContentState.ONLY_REMOTE
+    assert by["c.txt"].content_state == ContentState.ONLY_LEFT
+    assert by["b.txt"].content_state == ContentState.ONLY_RIGHT
 
     suggested_overrides = {diff.relpath: ACTION_SUGGESTED for diff in diffs}
     suggested_ops = build_plan_operations(diffs, suggested_overrides)
@@ -189,4 +208,23 @@ def test_asymmetric_dropboxignore_between_trees(
     assert suggested_actions == [
         ("copy_left", "b.txt"),
         ("copy_right", "c.txt"),
+    ]
+
+
+def test_suggested_propagates_detected_left_deletion(tmp_path) -> None:
+    left_root = _write_side(tmp_path, "left", {"x.txt": "same\n"})
+    right_root = _write_side(tmp_path, "right", {"x.txt": "same\n"})
+
+    before = compare_records(LocalScanner(left_root).scan(), LocalScanner(right_root).scan())
+    previous_content_states = {diff.relpath: diff.content_state for diff in before}
+
+    (left_root / "x.txt").unlink()
+
+    after = compare_records(LocalScanner(left_root).scan(), LocalScanner(right_root).scan())
+    hinted_after = apply_intentional_deletion_hints(after, previous_content_states)
+    suggested_overrides = {diff.relpath: ACTION_SUGGESTED for diff in hinted_after}
+    suggested_ops = build_plan_operations(hinted_after, suggested_overrides)
+
+    assert sorted((op.kind, op.relpath) for op in suggested_ops) == [
+        ("delete_right", "x.txt")
     ]

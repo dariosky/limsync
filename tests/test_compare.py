@@ -23,21 +23,21 @@ def test_union_and_sorted_paths() -> None:
     assert [d.relpath for d in diffs] == ["a.txt", "b.txt", "c.txt"]
 
 
-def test_only_local_and_only_remote_states() -> None:
+def test_only_left_and_only_right_states() -> None:
     local = {"left.txt": mk_file("left.txt", size=11)}
     remote = {"right.txt": mk_file("right.txt", size=22)}
 
     by = _by_path(compare_records(local, remote))
 
-    assert by["left.txt"].content_state == ContentState.ONLY_LOCAL
+    assert by["left.txt"].content_state == ContentState.ONLY_LEFT
     assert by["left.txt"].metadata_state == MetadataState.NOT_APPLICABLE
-    assert by["left.txt"].local_size == 11
-    assert by["left.txt"].remote_size is None
+    assert by["left.txt"].left_size == 11
+    assert by["left.txt"].right_size is None
 
-    assert by["right.txt"].content_state == ContentState.ONLY_REMOTE
+    assert by["right.txt"].content_state == ContentState.ONLY_RIGHT
     assert by["right.txt"].metadata_state == MetadataState.NOT_APPLICABLE
-    assert by["right.txt"].local_size is None
-    assert by["right.txt"].remote_size == 22
+    assert by["right.txt"].left_size is None
+    assert by["right.txt"].right_size == 22
 
 
 def test_type_mismatch_is_different() -> None:
@@ -79,8 +79,8 @@ def test_metadata_diff_details_and_source_precedence_mode_then_mtime() -> None:
     assert diff.metadata_state == MetadataState.DIFFERENT
     assert "mode" in diff.metadata_diff
     assert "mtime" in diff.metadata_diff
-    assert any("local=0x777 remote=0x600" in detail for detail in diff.metadata_details)
-    assert diff.metadata_source == "remote"
+    assert any("left=0x777 right=0x600" in detail for detail in diff.metadata_details)
+    assert diff.metadata_source == "right"
 
 
 def test_metadata_source_from_older_mtime_when_mode_same() -> None:
@@ -90,7 +90,7 @@ def test_metadata_source_from_older_mtime_when_mode_same() -> None:
     diff = compare_records(local, remote, mtime_tolerance_ns=0)[0]
     assert diff.metadata_state == MetadataState.DIFFERENT
     assert diff.metadata_diff == ("mtime",)
-    assert diff.metadata_source == "local"
+    assert diff.metadata_source == "left"
 
 
 def test_directory_metadata_can_drift_but_content_identical() -> None:

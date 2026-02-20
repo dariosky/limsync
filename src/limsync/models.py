@@ -13,9 +13,18 @@ class NodeType(str, Enum):
 class ContentState(str, Enum):
     IDENTICAL = "identical"
     DIFFERENT = "different"
-    ONLY_LOCAL = "only_local"
-    ONLY_REMOTE = "only_remote"
+    ONLY_LEFT = "only_left"
+    ONLY_RIGHT = "only_right"
     UNKNOWN = "unknown"
+
+    @classmethod
+    def from_storage(cls, value: str) -> ContentState:
+        text = str(value)
+        if text == "only_local":
+            return cls.ONLY_LEFT
+        if text == "only_remote":
+            return cls.ONLY_RIGHT
+        return cls(text)
 
 
 class MetadataState(str, Enum):
@@ -45,5 +54,5 @@ class DiffRecord:
     metadata_diff: tuple[str, ...]
     metadata_details: tuple[str, ...] = ()
     metadata_source: str | None = None
-    local_size: int | None = None
-    remote_size: int | None = None
+    left_size: int | None = None
+    right_size: int | None = None

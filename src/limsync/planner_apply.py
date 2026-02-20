@@ -15,6 +15,7 @@ from pathlib import Path
 import paramiko
 
 from .config import DEFAULT_REMOTE_PORT
+from .deletion_intent import DELETED_ON_LEFT, DELETED_ON_RIGHT
 from .endpoints import EndpointSpec, parse_endpoint, parse_legacy_remote_address
 from .models import ContentState, DiffRecord, MetadataState
 from .ssh_pool import pooled_ssh_client
@@ -120,37 +121,39 @@ def parse_remote_address(remote_address: str) -> tuple[str, str, str]:
 
 
 def _infer_metadata_source_from_details(diff: DiffRecord) -> str | None:
-    mode_re = re.compile(r"mode:\s+local=0x([0-7]{3})\s+remote=0x([0-7]{3})")
-    mtime_re = re.compile(r"mtime:\s+local=(.*?)\s+remote=(.*?)$")
+    mode_re = re.compile(
+        r"mode:\s+(?:left|local)=0x([0-7]{3})\s+(?:right|remote)=0x([0-7]{3})"
+    )
+    mtime_re = re.compile(r"mtime:\s+(?:left|local)=(.*?)\s+(?:right|remote)=(.*?)$")
 
     for detail in diff.metadata_details:
         mode_match = mode_re.match(detail)
         if mode_match:
-            local_mode = int(mode_match.group(1), 8)
-            remote_mode = int(mode_match.group(2), 8)
-            if local_mode != remote_mode:
-                return "local" if local_mode < remote_mode else "remote"
+            left_mode = int(mode_match.group(1), 8)
+            right_mode = int(mode_match.group(2), 8)
+            if left_mode != right_mode:
+                return "left" if left_mode < right_mode else "right"
 
     for detail in diff.metadata_details:
         mtime_match = mtime_re.match(detail)
         if mtime_match:
-            local_mtime = datetime.strptime(
+            left_mtime = datetime.strptime(
                 mtime_match.group(1), "%Y-%m-%d %H:%M:%S.%f UTC"
             )
-            remote_mtime = datetime.strptime(
+            right_mtime = datetime.strptime(
                 mtime_match.group(2), "%Y-%m-%d %H:%M:%S.%f UTC"
             )
-            if local_mtime != remote_mtime:
-                return "local" if local_mtime < remote_mtime else "remote"
+            if left_mtime != right_mtime:
+                return "left" if left_mtime < right_mtime else "right"
 
     return None
 
 
 def _suggested_metadata_op(relpath: str, diff: DiffRecord) -> list[PlanOperation]:
     source = diff.metadata_source or _infer_metadata_source_from_details(diff)
-    if source == "local":
+    if source == "left":
         return [PlanOperation("metadata_update_right", relpath)]
-    if source == "remote":
+    if source == "right":
         return [PlanOperation("metadata_update_left", relpath)]
     return []
 
@@ -177,16 +180,28 @@ def build_plan_operations(
         if action == ACTION_IGNORE:
             continue
 
-        if diff.content_state == ContentState.ONLY_LOCAL:
+        if diff.content_state == ContentState.ONLY_LEFT:
             if action in {ACTION_LEFT_WINS, ACTION_SUGGESTED}:
-                ops.append(PlanOperation("copy_right", diff.relpath))
+                if (
+                    action == ACTION_SUGGESTED
+                    and diff.metadata_source == DELETED_ON_RIGHT
+                ):
+                    ops.append(PlanOperation("delete_left", diff.relpath))
+                else:
+                    ops.append(PlanOperation("copy_right", diff.relpath))
             elif action == ACTION_RIGHT_WINS:
                 ops.append(PlanOperation("delete_left", diff.relpath))
             continue
 
-        if diff.content_state == ContentState.ONLY_REMOTE:
+        if diff.content_state == ContentState.ONLY_RIGHT:
             if action in {ACTION_RIGHT_WINS, ACTION_SUGGESTED}:
-                ops.append(PlanOperation("copy_left", diff.relpath))
+                if (
+                    action == ACTION_SUGGESTED
+                    and diff.metadata_source == DELETED_ON_LEFT
+                ):
+                    ops.append(PlanOperation("delete_right", diff.relpath))
+                else:
+                    ops.append(PlanOperation("copy_left", diff.relpath))
             elif action == ACTION_LEFT_WINS:
                 ops.append(PlanOperation("delete_right", diff.relpath))
             continue

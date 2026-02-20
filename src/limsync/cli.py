@@ -11,6 +11,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn
 
 from .compare import compare_records
 from .config import RemoteConfig
+from .deletion_intent import apply_intentional_deletion_hints
 from .endpoints import (
     EndpointSpec,
     default_endpoint_state_db,
@@ -27,6 +28,7 @@ from .state_db import (
     ScanStateSummary,
     get_state_context,
     get_ui_pref,
+    load_current_diffs,
     save_current_state,
 )
 
@@ -198,11 +200,23 @@ def _run_scan(
                 ),
             )
 
+    previous_content_states: dict[str, str] = {}
+    state_context = get_state_context(review_db_path)
+    if (
+        state_context is not None
+        and state_context.source_endpoint == endpoint_to_string(source_endpoint)
+        and state_context.destination_endpoint
+        == endpoint_to_string(destination_endpoint)
+    ):
+        for row in load_current_diffs(review_db_path):
+            previous_content_states[str(row["relpath"])] = str(row["content_state"])
+
     diffs = compare_records(source_records, destination_records)
+    diffs = apply_intentional_deletion_hints(diffs, previous_content_states)
 
     counts = {
-        ContentState.ONLY_LOCAL: 0,
-        ContentState.ONLY_REMOTE: 0,
+        ContentState.ONLY_LEFT: 0,
+        ContentState.ONLY_RIGHT: 0,
         ContentState.DIFFERENT: 0,
         ContentState.UNKNOWN: 0,
         ContentState.IDENTICAL: 0,
@@ -225,8 +239,8 @@ def _run_scan(
         source_files=len(source_records),
         destination_files=len(destination_records),
         compared_paths=len(diffs),
-        only_source=counts[ContentState.ONLY_LOCAL],
-        only_destination=counts[ContentState.ONLY_REMOTE],
+        only_source=counts[ContentState.ONLY_LEFT],
+        only_destination=counts[ContentState.ONLY_RIGHT],
         different_content=counts[ContentState.DIFFERENT],
         uncertain=counts[ContentState.UNKNOWN],
         metadata_only=metadata_only,
@@ -237,8 +251,8 @@ def _run_scan(
     console.print(f"Source files: {len(source_records)}")
     console.print(f"Destination files: {len(destination_records)}")
     console.print(f"Compared paths: {len(diffs)}")
-    console.print(f"Only source: {counts[ContentState.ONLY_LOCAL]}")
-    console.print(f"Only destination: {counts[ContentState.ONLY_REMOTE]}")
+    console.print(f"Only source: {counts[ContentState.ONLY_LEFT]}")
+    console.print(f"Only destination: {counts[ContentState.ONLY_RIGHT]}")
     console.print(f"Different content: {counts[ContentState.DIFFERENT]}")
     console.print(f"Uncertain (same size, mtime drift): {counts[ContentState.UNKNOWN]}")
     console.print(f"Metadata-only drift: {metadata_only}")

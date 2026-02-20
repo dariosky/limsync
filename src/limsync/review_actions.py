@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 from textual.widgets import Tree
 
 from .compare import compare_records
+from .deletion_intent import apply_intentional_deletion_hints
 from .modals import (
     ApplyRunModal,
     CommandsModal,
@@ -376,10 +377,18 @@ class ReviewActionsMixin:
         scope_is_dir = kind == "dir"
 
         try:
+            previous_content_states = {
+                relpath: diff.content_state
+                for relpath, diff in self.diffs_by_relpath.items()
+                if self._scope_match(relpath, scope_relpath, scope_is_dir)
+            }
             source_records, destination_records = self._scan_subtree_records(
                 scope_relpath, scope_is_dir
             )
             scoped_diffs = compare_records(source_records, destination_records)
+            scoped_diffs = apply_intentional_deletion_hints(
+                scoped_diffs, previous_content_states
+            )
             self._replace_scope_with_diffs(scope_relpath, scope_is_dir, scoped_diffs)
         except Exception as exc:  # noqa: BLE001
             self._notify_message(f"Update path failed: {exc}", severity="error")
@@ -449,11 +458,11 @@ class ReviewActionsMixin:
             diff = self.diffs_by_relpath.get(target_relpath)
             if diff is None:
                 continue
-            if diff.content_state != ContentState.ONLY_REMOTE:
+            if diff.content_state != ContentState.ONLY_RIGHT:
                 ops_by_key[("delete_left", target_relpath)] = PlanOperation(
                     "delete_left", target_relpath
                 )
-            if diff.content_state != ContentState.ONLY_LOCAL:
+            if diff.content_state != ContentState.ONLY_LEFT:
                 ops_by_key[("delete_right", target_relpath)] = PlanOperation(
                     "delete_right", target_relpath
                 )
@@ -624,7 +633,7 @@ class ReviewActionsMixin:
         if relpath is None:
             self._notify_message("Select a file to diff.", severity="warning")
             return
-        if not self._has_local_copy(relpath) or not self._has_remote_copy(relpath):
+        if not self._has_left_copy(relpath) or not self._has_right_copy(relpath):
             self._notify_message(
                 "Diff is available only when both left and right files exist.",
                 severity="warning",
@@ -647,8 +656,8 @@ class ReviewActionsMixin:
             self._notify_message("Select a file to open.", severity="warning")
             return
 
-        has_source = self._has_local_copy(relpath)
-        has_destination = self._has_remote_copy(relpath)
+        has_source = self._has_left_copy(relpath)
+        has_destination = self._has_right_copy(relpath)
         if has_source and has_destination:
             self.push_screen(
                 OpenSideModal(relpath),

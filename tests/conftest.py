@@ -50,8 +50,8 @@ def mk_diff(
     metadata_diff: tuple[str, ...] = (),
     metadata_details: tuple[str, ...] = (),
     metadata_source: str | None = None,
-    local_size: int | None = None,
-    remote_size: int | None = None,
+    left_size: int | None = None,
+    right_size: int | None = None,
 ) -> DiffRecord:
     return DiffRecord(
         relpath=relpath,
@@ -60,8 +60,8 @@ def mk_diff(
         metadata_diff=metadata_diff,
         metadata_details=metadata_details,
         metadata_source=metadata_source,
-        local_size=local_size,
-        remote_size=remote_size,
+        left_size=left_size,
+        right_size=right_size,
     )
 
 

@@ -70,18 +70,20 @@ def _ops_text(kinds: list[str]) -> str:
 
 def _parse_metadata_details(details: list[str]) -> dict[str, str]:
     parsed: dict[str, str] = {}
-    mode_re = re.compile(r"mode:\s+local=(0x[0-7]{3})\s+remote=(0x[0-7]{3})")
-    mtime_re = re.compile(r"mtime:\s+local=(.*?)\s+remote=(.*?)$")
+    mode_re = re.compile(
+        r"mode:\s+(?:left|local)=(0x[0-7]{3})\s+(?:right|remote)=(0x[0-7]{3})"
+    )
+    mtime_re = re.compile(r"mtime:\s+(?:left|local)=(.*?)\s+(?:right|remote)=(.*?)$")
     for detail in details:
         mode_match = mode_re.match(detail)
         if mode_match:
-            parsed["mode_local"] = mode_match.group(1)
-            parsed["mode_remote"] = mode_match.group(2)
+            parsed["mode_left"] = mode_match.group(1)
+            parsed["mode_right"] = mode_match.group(2)
             continue
         mtime_match = mtime_re.match(detail)
         if mtime_match:
-            parsed["mtime_local"] = mtime_match.group(1)
-            parsed["mtime_remote"] = mtime_match.group(2)
+            parsed["mtime_left"] = mtime_match.group(1)
+            parsed["mtime_right"] = mtime_match.group(2)
     return parsed
 
 
@@ -96,12 +98,12 @@ def _suggested_action_with_reason(entry: FileEntry, suggested_ops: list[str]) ->
 
     source = "left" if primary == "metadata_update_right" else "right"
     parsed = _parse_metadata_details(entry.metadata_details)
-    if "mode" in entry.metadata_diff and parsed.get("mode_local") != parsed.get(
-        "mode_remote"
+    if "mode" in entry.metadata_diff and parsed.get("mode_left") != parsed.get(
+        "mode_right"
     ):
         return f"copy more restrictive metadata from {source}"
-    if "mtime" in entry.metadata_diff and parsed.get("mtime_local") != parsed.get(
-        "mtime_remote"
+    if "mtime" in entry.metadata_diff and parsed.get("mtime_left") != parsed.get(
+        "mtime_right"
     ):
         return f"copy older metadata from {source}"
     return f"copy metadata from {source}"
@@ -119,7 +121,11 @@ def _ops_direction_marker(kinds: list[str]) -> str:
     )
     has_delete = any(kind in {"delete_left", "delete_right"} for kind in kinds)
     if has_delete:
-        return " DEL<- " if "delete_left" in kinds else " DEL-> "
+        if "delete_left" in kinds and "delete_right" in kinds:
+            return " <=DEL=> "
+        if "delete_left" in kinds:
+            return " <=DEL "
+        return " DEL=> "
     if has_left and has_right:
         return " <-> "
     if has_left:
@@ -469,8 +475,8 @@ class ReviewApp(ReviewActionsMixin, App[None]):
         lines = [
             f"Folder: {entry.relpath}",
             "",
-            f"Only left: {c.only_local}",
-            f"Only right: {c.only_remote}",
+            f"Only left: {c.only_left}",
+            f"Only right: {c.only_right}",
             f"Different: {c.different}",
             f"Metadata: {c.metadata_only + c.uncertain}",
             f"Metadata fields: {meta_fields}",
@@ -487,28 +493,28 @@ class ReviewApp(ReviewActionsMixin, App[None]):
             entry.relpath, self._effective_action(entry.relpath)
         )
         lines = [f"File: {entry.relpath}", ""]
-        if entry.local_size is not None and entry.remote_size is not None:
-            if entry.local_size == entry.remote_size:
-                lines.append(f"Size: {entry.local_size:,} bytes")
+        if entry.left_size is not None and entry.right_size is not None:
+            if entry.left_size == entry.right_size:
+                lines.append(f"Size: {entry.left_size:,} bytes")
             else:
                 lines.append(
-                    f"Size: left={entry.local_size:,} bytes right={entry.remote_size:,} bytes"
+                    f"Size: left={entry.left_size:,} bytes right={entry.right_size:,} bytes"
                 )
-        elif entry.local_size is not None:
-            lines.append(f"Size: left={entry.local_size:,} bytes")
-        elif entry.remote_size is not None:
-            lines.append(f"Size: right={entry.remote_size:,} bytes")
+        elif entry.left_size is not None:
+            lines.append(f"Size: left={entry.left_size:,} bytes")
+        elif entry.right_size is not None:
+            lines.append(f"Size: right={entry.right_size:,} bytes")
         if entry.content_state not in {"identical", "unknown"}:
             lines.append(f"Content state: {entry.content_state}")
         if entry.metadata_state == "different":
             parsed = _parse_metadata_details(entry.metadata_details)
-            if parsed.get("mode_local") != parsed.get("mode_remote"):
+            if parsed.get("mode_left") != parsed.get("mode_right"):
                 lines.append(
-                    f"Permissions: left={parsed.get('mode_local', '?')} right={parsed.get('mode_remote', '?')}"
+                    f"Permissions: left={parsed.get('mode_left', '?')} right={parsed.get('mode_right', '?')}"
                 )
-            if parsed.get("mtime_local") != parsed.get("mtime_remote"):
+            if parsed.get("mtime_left") != parsed.get("mtime_right"):
                 lines.append(
-                    f"MTime: left={parsed.get('mtime_local', '?')} right={parsed.get('mtime_remote', '?')}"
+                    f"MTime: left={parsed.get('mtime_left', '?')} right={parsed.get('mtime_right', '?')}"
                 )
         lines.extend(
             [
@@ -636,13 +642,13 @@ class ReviewApp(ReviewActionsMixin, App[None]):
                 sftp.close()
         return target
 
-    def _has_local_copy(self, relpath: str) -> bool:
+    def _has_left_copy(self, relpath: str) -> bool:
         diff = self.diffs_by_relpath.get(relpath)
-        return diff is not None and diff.content_state != ContentState.ONLY_REMOTE
+        return diff is not None and diff.content_state != ContentState.ONLY_RIGHT
 
-    def _has_remote_copy(self, relpath: str) -> bool:
+    def _has_right_copy(self, relpath: str) -> bool:
         diff = self.diffs_by_relpath.get(relpath)
-        return diff is not None and diff.content_state != ContentState.ONLY_LOCAL
+        return diff is not None and diff.content_state != ContentState.ONLY_LEFT
 
     def _open_file_side(self, relpath: str, side: str) -> None:
         try:
@@ -744,12 +750,12 @@ class ReviewApp(ReviewActionsMixin, App[None]):
             file_entry.metadata_diff = []
             file_entry.metadata_details = []
             resolved_size = (
-                file_entry.local_size
-                if file_entry.local_size is not None
-                else file_entry.remote_size
+                file_entry.left_size
+                if file_entry.left_size is not None
+                else file_entry.right_size
             )
-            file_entry.local_size = resolved_size
-            file_entry.remote_size = resolved_size
+            file_entry.left_size = resolved_size
+            file_entry.right_size = resolved_size
             new_counts = _file_counts(file_entry)
 
             self.diffs_by_relpath[relpath] = DiffRecord(
@@ -758,8 +764,8 @@ class ReviewApp(ReviewActionsMixin, App[None]):
                 metadata_state=MetadataState.IDENTICAL,
                 metadata_diff=(),
                 metadata_details=(),
-                local_size=file_entry.local_size,
-                remote_size=file_entry.remote_size,
+                left_size=file_entry.left_size,
+                right_size=file_entry.right_size,
             )
             self.action_overrides.pop(relpath, None)
             override_updates[relpath] = ACTION_IGNORE
@@ -780,8 +786,8 @@ class ReviewApp(ReviewActionsMixin, App[None]):
                 if dir_entry is None:
                     continue
                 counts = dir_entry.counts
-                counts.only_local += new_counts.only_local - old_counts.only_local
-                counts.only_remote += new_counts.only_remote - old_counts.only_remote
+                counts.only_left += new_counts.only_left - old_counts.only_left
+                counts.only_right += new_counts.only_right - old_counts.only_right
                 counts.identical += new_counts.identical - old_counts.identical
                 counts.metadata_only += (
                     new_counts.metadata_only - old_counts.metadata_only

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from limsync.models import ContentState, MetadataState
+from limsync.deletion_intent import DELETED_ON_LEFT, DELETED_ON_RIGHT
 from limsync.planner_apply import (
     ACTION_LEFT_WINS,
     ACTION_RIGHT_WINS,
@@ -57,30 +58,30 @@ def test_infer_metadata_source_from_details_mode_then_mtime() -> None:
         "x",
         content_state=ContentState.IDENTICAL,
         metadata_state=MetadataState.DIFFERENT,
-        metadata_details=("mode: local=0x777 remote=0x600",),
+        metadata_details=("mode: left=0x777 right=0x600",),
     )
-    assert _infer_metadata_source_from_details(mode_diff) == "remote"
+    assert _infer_metadata_source_from_details(mode_diff) == "right"
 
     mtime_diff = mk_diff(
         "x",
         content_state=ContentState.IDENTICAL,
         metadata_state=MetadataState.DIFFERENT,
         metadata_details=(
-            "mtime: local=2024-01-01 00:00:00.000000 UTC remote=2024-01-02 00:00:00.000000 UTC",
+            "mtime: left=2024-01-01 00:00:00.000000 UTC right=2024-01-02 00:00:00.000000 UTC",
         ),
     )
-    assert _infer_metadata_source_from_details(mtime_diff) == "local"
+    assert _infer_metadata_source_from_details(mtime_diff) == "left"
 
 
 def test_build_plan_operations_default_ignore_no_ops() -> None:
-    diffs = [mk_diff("a", content_state=ContentState.ONLY_LOCAL)]
+    diffs = [mk_diff("a", content_state=ContentState.ONLY_LEFT)]
     assert build_plan_operations(diffs, {}) == []
 
 
-def test_build_plan_only_local_only_remote_directions() -> None:
+def test_build_plan_only_left_only_right_directions() -> None:
     diffs = [
-        mk_diff("left", content_state=ContentState.ONLY_LOCAL),
-        mk_diff("right", content_state=ContentState.ONLY_REMOTE),
+        mk_diff("left", content_state=ContentState.ONLY_LEFT),
+        mk_diff("right", content_state=ContentState.ONLY_RIGHT),
     ]
 
     assert _ops_set(
@@ -98,19 +99,47 @@ def test_build_plan_only_local_only_remote_directions() -> None:
     ) == {("delete_left", "left"), ("delete_right", "right")}
 
 
+def test_build_plan_suggested_honors_intentional_deletion_hints() -> None:
+    diffs = [
+        mk_diff(
+            "left_deleted",
+            content_state=ContentState.ONLY_RIGHT,
+            metadata_source=DELETED_ON_LEFT,
+        ),
+        mk_diff(
+            "right_deleted",
+            content_state=ContentState.ONLY_LEFT,
+            metadata_source=DELETED_ON_RIGHT,
+        ),
+    ]
+
+    assert _ops_set(
+        build_plan_operations(
+            diffs,
+            {
+                "left_deleted": ACTION_SUGGESTED,
+                "right_deleted": ACTION_SUGGESTED,
+            },
+        )
+    ) == {
+        ("delete_right", "left_deleted"),
+        ("delete_left", "right_deleted"),
+    }
+
+
 def test_build_plan_different_unknown_and_metadata_rules() -> None:
     diffs = [
         mk_diff(
             "conflict",
             content_state=ContentState.DIFFERENT,
             metadata_state=MetadataState.DIFFERENT,
-            metadata_source="local",
+            metadata_source="left",
         ),
         mk_diff(
             "uncertain",
             content_state=ContentState.UNKNOWN,
             metadata_state=MetadataState.DIFFERENT,
-            metadata_source="remote",
+            metadata_source="right",
         ),
     ]
 

@@ -15,78 +15,78 @@ def _format_mtime_ns(value: int) -> str:
 
 
 def _same_metadata(
-    local: FileRecord, remote: FileRecord, mtime_tolerance_ns: int
+    left: FileRecord, right: FileRecord, mtime_tolerance_ns: int
 ) -> tuple[bool, tuple[str, ...], tuple[str, ...]]:
     diff: list[str] = []
     details: list[str] = []
-    if local.mode != remote.mode:
+    if left.mode != right.mode:
         diff.append("mode")
         details.append(
-            f"mode: local={_format_mode(local.mode)} remote={_format_mode(remote.mode)}"
+            f"mode: left={_format_mode(left.mode)} right={_format_mode(right.mode)}"
         )
-    if abs(local.mtime_ns - remote.mtime_ns) > mtime_tolerance_ns:
+    if abs(left.mtime_ns - right.mtime_ns) > mtime_tolerance_ns:
         diff.append("mtime")
         details.append(
-            f"mtime: local={_format_mtime_ns(local.mtime_ns)} remote={_format_mtime_ns(remote.mtime_ns)}"
+            f"mtime: left={_format_mtime_ns(left.mtime_ns)} right={_format_mtime_ns(right.mtime_ns)}"
         )
     return (len(diff) == 0, tuple(diff), tuple(details))
 
 
 def _preferred_metadata_source(
-    local: FileRecord, remote: FileRecord, metadata_diff: tuple[str, ...]
+    left: FileRecord, right: FileRecord, metadata_diff: tuple[str, ...]
 ) -> str | None:
-    if "mode" in metadata_diff and local.mode != remote.mode:
-        return "local" if local.mode < remote.mode else "remote"
-    if "mtime" in metadata_diff and local.mtime_ns != remote.mtime_ns:
-        return "local" if local.mtime_ns < remote.mtime_ns else "remote"
+    if "mode" in metadata_diff and left.mode != right.mode:
+        return "left" if left.mode < right.mode else "right"
+    if "mtime" in metadata_diff and left.mtime_ns != right.mtime_ns:
+        return "left" if left.mtime_ns < right.mtime_ns else "right"
     return None
 
 
 def compare_records(
-    local_records: dict[str, FileRecord],
-    remote_records: dict[str, FileRecord],
+    left_records: dict[str, FileRecord],
+    right_records: dict[str, FileRecord],
     mtime_tolerance_ns: int = 2_000_000_000,
 ) -> list[DiffRecord]:
     diffs: list[DiffRecord] = []
-    all_paths = sorted(set(local_records) | set(remote_records))
+    all_paths = sorted(set(left_records) | set(right_records))
 
     for relpath in all_paths:
-        local = local_records.get(relpath)
-        remote = remote_records.get(relpath)
+        left = left_records.get(relpath)
+        right = right_records.get(relpath)
 
-        if local and not remote:
+        if left and not right:
             diffs.append(
                 DiffRecord(
                     relpath=relpath,
-                    content_state=ContentState.ONLY_LOCAL,
+                    content_state=ContentState.ONLY_LEFT,
                     metadata_state=MetadataState.NOT_APPLICABLE,
                     metadata_diff=(),
                     metadata_details=(),
                     metadata_source=None,
-                    local_size=local.size,
-                    remote_size=None,
+                    left_size=left.size,
+                    right_size=None,
                 )
             )
             continue
 
-        if remote and not local:
+        if right and not left:
             diffs.append(
                 DiffRecord(
                     relpath=relpath,
-                    content_state=ContentState.ONLY_REMOTE,
+                    content_state=ContentState.ONLY_RIGHT,
                     metadata_state=MetadataState.NOT_APPLICABLE,
                     metadata_diff=(),
                     metadata_details=(),
                     metadata_source=None,
-                    local_size=None,
-                    remote_size=remote.size,
+                    left_size=None,
+                    right_size=right.size,
                 )
             )
             continue
 
-        assert local is not None and remote is not None
+        assert left is not None and right is not None
 
-        if local.node_type != remote.node_type:
+        if left.node_type != right.node_type:
             diffs.append(
                 DiffRecord(
                     relpath=relpath,
@@ -94,24 +94,24 @@ def compare_records(
                     metadata_state=MetadataState.DIFFERENT,
                     metadata_diff=("type",),
                     metadata_details=(
-                        f"type: {local.node_type.value} -> {remote.node_type.value}",
+                        f"type: {left.node_type.value} -> {right.node_type.value}",
                     ),
                     metadata_source=None,
-                    local_size=local.size,
-                    remote_size=remote.size,
+                    left_size=left.size,
+                    right_size=right.size,
                 )
             )
             continue
 
         same_metadata, metadata_diff, metadata_details = _same_metadata(
-            local, remote, mtime_tolerance_ns
+            left, right, mtime_tolerance_ns
         )
-        metadata_source = _preferred_metadata_source(local, remote, metadata_diff)
+        metadata_source = _preferred_metadata_source(left, right, metadata_diff)
 
-        if local.node_type == NodeType.SYMLINK:
-            local_target = local.link_target_key or local.link_target
-            remote_target = remote.link_target_key or remote.link_target
-            same_symlink_target = local_target == remote_target
+        if left.node_type == NodeType.SYMLINK:
+            left_target = left.link_target_key or left.link_target
+            right_target = right.link_target_key or right.link_target
+            same_symlink_target = left_target == right_target
             diffs.append(
                 DiffRecord(
                     relpath=relpath,
@@ -124,13 +124,13 @@ def compare_records(
                     metadata_diff=(),
                     metadata_details=(),
                     metadata_source=None,
-                    local_size=local.size,
-                    remote_size=remote.size,
+                    left_size=left.size,
+                    right_size=right.size,
                 )
             )
             continue
 
-        if local.node_type != NodeType.FILE:
+        if left.node_type != NodeType.FILE:
             diffs.append(
                 DiffRecord(
                     relpath=relpath,
@@ -141,20 +141,20 @@ def compare_records(
                     metadata_diff=metadata_diff,
                     metadata_details=metadata_details,
                     metadata_source=metadata_source,
-                    local_size=local.size,
-                    remote_size=remote.size,
+                    left_size=left.size,
+                    right_size=right.size,
                 )
             )
             continue
 
         same_content = (
-            local.size == remote.size
-            and abs(local.mtime_ns - remote.mtime_ns) <= mtime_tolerance_ns
+            left.size == right.size
+            and abs(left.mtime_ns - right.mtime_ns) <= mtime_tolerance_ns
         )
 
         if same_content:
             content_state = ContentState.IDENTICAL
-        elif local.size == remote.size:
+        elif left.size == right.size:
             content_state = ContentState.UNKNOWN
         else:
             content_state = ContentState.DIFFERENT
@@ -169,8 +169,8 @@ def compare_records(
                 metadata_diff=metadata_diff,
                 metadata_details=metadata_details,
                 metadata_source=metadata_source,
-                local_size=local.size,
-                remote_size=remote.size,
+                left_size=left.size,
+                right_size=right.size,
             )
         )
 

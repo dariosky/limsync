@@ -55,8 +55,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             local_files INTEGER NOT NULL,
             remote_files INTEGER NOT NULL,
             compared_paths INTEGER NOT NULL,
-            only_local INTEGER NOT NULL,
-            only_remote INTEGER NOT NULL,
+            only_left INTEGER NOT NULL,
+            only_right INTEGER NOT NULL,
             different_content INTEGER NOT NULL,
             uncertain INTEGER NOT NULL,
             metadata_only INTEGER NOT NULL
@@ -73,8 +73,8 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             metadata_diff_json TEXT NOT NULL,
             metadata_detail_json TEXT NOT NULL DEFAULT '[]',
             metadata_source TEXT,
-            local_size INTEGER,
-            remote_size INTEGER
+            left_size INTEGER,
+            right_size INTEGER
         )
         """
     )
@@ -94,10 +94,10 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )
     if "metadata_source" not in col_names:
         conn.execute("ALTER TABLE current_diffs ADD COLUMN metadata_source TEXT")
-    if "local_size" not in col_names:
-        conn.execute("ALTER TABLE current_diffs ADD COLUMN local_size INTEGER")
-    if "remote_size" not in col_names:
-        conn.execute("ALTER TABLE current_diffs ADD COLUMN remote_size INTEGER")
+    if "left_size" not in col_names:
+        conn.execute("ALTER TABLE current_diffs ADD COLUMN left_size INTEGER")
+    if "right_size" not in col_names:
+        conn.execute("ALTER TABLE current_diffs ADD COLUMN right_size INTEGER")
 
     meta_cols = conn.execute("PRAGMA table_info(state_meta)").fetchall()
     meta_col_names = {str(col["name"]) for col in meta_cols}
@@ -105,6 +105,18 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE state_meta ADD COLUMN source_endpoint TEXT")
     if "destination_endpoint" not in meta_col_names:
         conn.execute("ALTER TABLE state_meta ADD COLUMN destination_endpoint TEXT")
+    if "only_left" not in meta_col_names:
+        conn.execute("ALTER TABLE state_meta ADD COLUMN only_left INTEGER")
+        if "only_local" in meta_col_names:
+            conn.execute(
+                "UPDATE state_meta SET only_left = only_local WHERE only_left IS NULL"
+            )
+    if "only_right" not in meta_col_names:
+        conn.execute("ALTER TABLE state_meta ADD COLUMN only_right INTEGER")
+        if "only_remote" in meta_col_names:
+            conn.execute(
+                "UPDATE state_meta SET only_right = only_remote WHERE only_right IS NULL"
+            )
 
     conn.execute(
         """
@@ -168,8 +180,8 @@ def save_current_state(
                     local_files,
                     remote_files,
                     compared_paths,
-                    only_local,
-                    only_remote,
+                    only_left,
+                    only_right,
                     different_content,
                     uncertain,
                     metadata_only,
@@ -185,8 +197,8 @@ def save_current_state(
                     local_files = excluded.local_files,
                     remote_files = excluded.remote_files,
                     compared_paths = excluded.compared_paths,
-                    only_local = excluded.only_local,
-                    only_remote = excluded.only_remote,
+                    only_left = excluded.only_left,
+                    only_right = excluded.only_right,
                     different_content = excluded.different_content,
                     uncertain = excluded.uncertain,
                     metadata_only = excluded.metadata_only,
@@ -220,8 +232,8 @@ def save_current_state(
                     metadata_diff_json,
                     metadata_detail_json,
                     metadata_source,
-                    local_size,
-                    remote_size
+                    left_size,
+                    right_size
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(relpath) DO UPDATE SET
                     content_state = excluded.content_state,
@@ -229,8 +241,8 @@ def save_current_state(
                     metadata_diff_json = excluded.metadata_diff_json,
                     metadata_detail_json = excluded.metadata_detail_json,
                     metadata_source = excluded.metadata_source,
-                    local_size = excluded.local_size,
-                    remote_size = excluded.remote_size
+                    left_size = excluded.left_size,
+                    right_size = excluded.right_size
                 """,
                 [
                     (
@@ -242,8 +254,8 @@ def save_current_state(
                         normalize_text(diff.metadata_source)
                         if diff.metadata_source is not None
                         else None,
-                        diff.local_size,
-                        diff.remote_size,
+                        diff.left_size,
+                        diff.right_size,
                     )
                     for diff in diffs
                 ],
@@ -290,12 +302,19 @@ def load_current_diffs(db_path: Path) -> list[dict[str, object]]:
     conn = _connect(db_path)
     try:
         _init_schema(conn)
+        cols = conn.execute("PRAGMA table_info(current_diffs)").fetchall()
+        col_names = {str(col["name"]) for col in cols}
+        left_expr = "left_size"
+        right_expr = "right_size"
+        if "local_size" in col_names:
+            left_expr = "COALESCE(left_size, local_size) AS left_size"
+        if "remote_size" in col_names:
+            right_expr = "COALESCE(right_size, remote_size) AS right_size"
         rows = conn.execute(
-            """
-            SELECT relpath, content_state, metadata_state, metadata_diff_json, metadata_detail_json, metadata_source, local_size, remote_size
-            FROM current_diffs
-            ORDER BY relpath
-            """
+            "SELECT relpath, content_state, metadata_state, metadata_diff_json, "
+            "metadata_detail_json, metadata_source, "
+            f"{left_expr}, {right_expr} "
+            "FROM current_diffs ORDER BY relpath"
         ).fetchall()
         return [
             {
@@ -305,8 +324,8 @@ def load_current_diffs(db_path: Path) -> list[dict[str, object]]:
                 "metadata_diff": json.loads(row["metadata_diff_json"]),
                 "metadata_details": json.loads(row["metadata_detail_json"] or "[]"),
                 "metadata_source": row["metadata_source"],
-                "local_size": row["local_size"],
-                "remote_size": row["remote_size"],
+                "left_size": row["left_size"],
+                "right_size": row["right_size"],
             }
             for row in rows
         ]
@@ -471,8 +490,8 @@ def replace_diffs_in_scope(
                     metadata_diff_json,
                     metadata_detail_json,
                     metadata_source,
-                    local_size,
-                    remote_size
+                    left_size,
+                    right_size
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(relpath) DO UPDATE SET
                     content_state = excluded.content_state,
@@ -480,8 +499,8 @@ def replace_diffs_in_scope(
                     metadata_diff_json = excluded.metadata_diff_json,
                     metadata_detail_json = excluded.metadata_detail_json,
                     metadata_source = excluded.metadata_source,
-                    local_size = excluded.local_size,
-                    remote_size = excluded.remote_size
+                    left_size = excluded.left_size,
+                    right_size = excluded.right_size
                 """,
                 [
                     (
@@ -493,8 +512,8 @@ def replace_diffs_in_scope(
                         normalize_text(diff.metadata_source)
                         if diff.metadata_source is not None
                         else None,
-                        diff.local_size,
-                        diff.remote_size,
+                        diff.left_size,
+                        diff.right_size,
                     )
                     for diff in diffs
                 ],

@@ -10,8 +10,8 @@ from .models import ContentState, DiffRecord, MetadataState
 
 @dataclass
 class FolderCounts:
-    only_local: int = 0
-    only_remote: int = 0
+    only_left: int = 0
+    only_right: int = 0
     identical: int = 0
     metadata_only: int = 0
     different: int = 0
@@ -27,8 +27,8 @@ class FileEntry:
     metadata_state: str
     metadata_diff: list[str]
     metadata_details: list[str]
-    local_size: int | None
-    remote_size: int | None
+    left_size: int | None
+    right_size: int | None
 
 
 @dataclass
@@ -42,10 +42,10 @@ class DirEntry:
 
 def _file_counts(file_entry: FileEntry) -> FolderCounts:
     counts = FolderCounts()
-    if file_entry.content_state == "only_local":
-        counts.only_local = 1
-    elif file_entry.content_state == "only_remote":
-        counts.only_remote = 1
+    if file_entry.content_state == "only_left":
+        counts.only_left = 1
+    elif file_entry.content_state == "only_right":
+        counts.only_right = 1
     elif file_entry.content_state == "different":
         counts.different = 1
     elif file_entry.content_state == "unknown":
@@ -63,8 +63,8 @@ def _file_counts(file_entry: FileEntry) -> FolderCounts:
 
 
 def _apply_counts(target: FolderCounts, increment: FolderCounts) -> None:
-    target.only_local += increment.only_local
-    target.only_remote += increment.only_remote
+    target.only_left += increment.only_left
+    target.only_right += increment.only_right
     target.identical += increment.identical
     target.metadata_only += increment.metadata_only
     target.different += increment.different
@@ -76,8 +76,8 @@ def _apply_counts(target: FolderCounts, increment: FolderCounts) -> None:
 def _is_identical_folder(entry: DirEntry) -> bool:
     c = entry.counts
     return (
-        c.only_local == 0
-        and c.only_remote == 0
+        c.only_left == 0
+        and c.only_right == 0
         and c.metadata_only == 0
         and c.different == 0
         and c.uncertain == 0
@@ -92,8 +92,8 @@ def _is_changed(entry: FileEntry) -> bool:
 
 def _folder_label(entry: DirEntry, *, include_identical: bool = True) -> Text:
     c = entry.counts
-    only_left = c.only_local
-    only_right = c.only_remote
+    only_left = c.only_left
+    only_right = c.only_right
     parts: list[str] = []
     if only_left:
         parts.append(f"Left {only_left}")
@@ -111,9 +111,9 @@ def _folder_label(entry: DirEntry, *, include_identical: bool = True) -> Text:
 
 
 def _file_label(file_entry: FileEntry) -> Text:
-    if file_entry.content_state == "only_local":
+    if file_entry.content_state == "only_left":
         badge = "Left"
-    elif file_entry.content_state == "only_remote":
+    elif file_entry.content_state == "only_right":
         badge = "Right"
     elif file_entry.content_state == "different":
         badge = "Conflict"
@@ -133,9 +133,10 @@ def _file_label(file_entry: FileEntry) -> Text:
 
 
 def _row_to_diff(row: dict[str, object]) -> DiffRecord:
+    content_state = ContentState.from_storage(str(row["content_state"]))
     return DiffRecord(
         relpath=str(row["relpath"]),
-        content_state=ContentState(str(row["content_state"])),
+        content_state=content_state,
         metadata_state=MetadataState(str(row["metadata_state"])),
         metadata_diff=tuple(str(item) for item in row.get("metadata_diff", [])),
         metadata_details=tuple(str(item) for item in row.get("metadata_details", [])),
@@ -144,12 +145,12 @@ def _row_to_diff(row: dict[str, object]) -> DiffRecord:
             if row.get("metadata_source") is not None
             else None
         ),
-        local_size=(
-            int(row["local_size"]) if row.get("local_size") is not None else None
-        ),
-        remote_size=(
-            int(row["remote_size"]) if row.get("remote_size") is not None else None
-        ),
+        left_size=int(row["left_size"])
+        if row.get("left_size") is not None
+        else (int(row["local_size"]) if row.get("local_size") is not None else None),
+        right_size=int(row["right_size"])
+        if row.get("right_size") is not None
+        else (int(row["remote_size"]) if row.get("remote_size") is not None else None),
     )
 
 
@@ -203,14 +204,18 @@ def _build_model(
         file_entry = FileEntry(
             relpath=relpath,
             name=parts[-1],
-            content_state=str(row["content_state"]),
+            content_state=ContentState.from_storage(str(row["content_state"])).value,
             metadata_state=str(row["metadata_state"]),
             metadata_diff=list(row.get("metadata_diff", [])),
             metadata_details=list(row.get("metadata_details", [])),
-            local_size=(
+            left_size=int(row["left_size"])
+            if row.get("left_size") is not None
+            else (
                 int(row["local_size"]) if row.get("local_size") is not None else None
             ),
-            remote_size=(
+            right_size=int(row["right_size"])
+            if row.get("right_size") is not None
+            else (
                 int(row["remote_size"]) if row.get("remote_size") is not None else None
             ),
         )

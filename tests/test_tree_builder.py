@@ -9,8 +9,8 @@ def _mk_file_entry(content_state: str, metadata_state: str = "identical") -> Fil
         metadata_state=metadata_state,
         metadata_diff=[],
         metadata_details=[],
-        local_size=None,
-        remote_size=None,
+        left_size=None,
+        right_size=None,
     )
 
 
@@ -19,8 +19,8 @@ def test_folder_label_hides_zero_counts_and_uses_readable_names() -> None:
         name="docs",
         relpath="docs",
         counts=FolderCounts(
-            only_local=2,
-            only_remote=0,
+            only_left=2,
+            only_right=0,
             identical=0,
             metadata_only=3,
             different=1,
@@ -40,7 +40,7 @@ def test_folder_label_can_hide_identical_count() -> None:
     entry = DirEntry(
         name="docs",
         relpath="docs",
-        counts=FolderCounts(only_local=1, identical=9, metadata_only=2),
+        counts=FolderCounts(only_left=1, identical=9, metadata_only=2),
     )
 
     assert (
@@ -54,8 +54,8 @@ def test_folder_label_orders_left_right_conflict_metadata_and_merges_uncertain()
         name="docs",
         relpath="docs",
         counts=FolderCounts(
-            only_local=2,
-            only_remote=1,
+            only_left=2,
+            only_right=1,
             different=3,
             metadata_only=4,
             uncertain=5,
@@ -69,7 +69,7 @@ def test_folder_label_orders_left_right_conflict_metadata_and_merges_uncertain()
 
 
 def test_file_label_uses_readable_badges() -> None:
-    assert _file_label(_mk_file_entry("only_local")).plain == "a.txt  [Left] -"
-    assert _file_label(_mk_file_entry("only_remote")).plain == "a.txt  [Right] -"
+    assert _file_label(_mk_file_entry("only_left")).plain == "a.txt  [Left] -"
+    assert _file_label(_mk_file_entry("only_right")).plain == "a.txt  [Right] -"
     assert _file_label(_mk_file_entry("different")).plain == "a.txt  [Conflict] -"
     assert _file_label(_mk_file_entry("identical", "different")).plain == "a.txt  [Metadata] -"
