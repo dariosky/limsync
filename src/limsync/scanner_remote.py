@@ -136,7 +136,15 @@ class RemoteScanner:
             .with_name("ignore_rules_shared.py")
             .read_text(encoding="utf-8")
         )
-        indented = "\n".join(
-            f"    {line}" if line else "" for line in shared_source.splitlines()
-        )
-        return helper_source.replace(marker, indented)
+        lines = helper_source.splitlines()
+        for idx, line in enumerate(lines):
+            if marker not in line:
+                continue
+            indent = line[: line.index(marker)]
+            injected = [
+                f"{indent}{shared}" if shared else ""
+                for shared in shared_source.splitlines()
+            ]
+            lines[idx : idx + 1] = injected
+            return "\n".join(lines) + ("\n" if helper_source.endswith("\n") else "")
+        return helper_source

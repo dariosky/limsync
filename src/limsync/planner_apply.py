@@ -121,10 +121,8 @@ def parse_remote_address(remote_address: str) -> tuple[str, str, str]:
 
 
 def _infer_metadata_source_from_details(diff: DiffRecord) -> str | None:
-    mode_re = re.compile(
-        r"mode:\s+(?:left|local)=0x([0-7]{3})\s+(?:right|remote)=0x([0-7]{3})"
-    )
-    mtime_re = re.compile(r"mtime:\s+(?:left|local)=(.*?)\s+(?:right|remote)=(.*?)$")
+    mode_re = re.compile(r"mode:\s+left=0x([0-7]{3})\s+right=0x([0-7]{3})")
+    mtime_re = re.compile(r"mtime:\s+left=(.*?)\s+right=(.*?)$")
 
     for detail in diff.metadata_details:
         mode_match = mode_re.match(detail)

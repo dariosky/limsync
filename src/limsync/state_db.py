@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tomllib
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from .models import DiffRecord
@@ -38,8 +40,78 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     return conn
 
 
+@lru_cache(maxsize=1)
+def _project_version() -> str:
+    pyproject = Path(__file__).resolve().parents[2] / "pyproject.toml"
+    data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    version = str(data["project"]["version"]).strip()
+    if not version:
+        raise RuntimeError("project.version in pyproject.toml is empty")
+    return version
+
+
+def _drop_all_user_objects(conn: sqlite3.Connection) -> None:
+    rows = conn.execute(
+        """
+        SELECT type, name
+        FROM sqlite_master
+        WHERE name NOT LIKE 'sqlite_%'
+        ORDER BY CASE type WHEN 'view' THEN 0 WHEN 'trigger' THEN 1 WHEN 'index' THEN 2 WHEN 'table' THEN 3 ELSE 4 END
+        """
+    ).fetchall()
+    for row in rows:
+        obj_type = str(row["type"])
+        name = str(row["name"])
+        quoted = f'"{name}"'
+        if obj_type == "table":
+            conn.execute(f"DROP TABLE IF EXISTS {quoted}")
+        elif obj_type == "index":
+            conn.execute(f"DROP INDEX IF EXISTS {quoted}")
+        elif obj_type == "trigger":
+            conn.execute(f"DROP TRIGGER IF EXISTS {quoted}")
+        elif obj_type == "view":
+            conn.execute(f"DROP VIEW IF EXISTS {quoted}")
+
+
+def _ensure_versioned_db(conn: sqlite3.Connection) -> None:
+    expected_version = _project_version()
+    try:
+        row = conn.execute(
+            """
+            SELECT value
+            FROM limsync
+            WHERE key = 'version'
+            """
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is None or str(row["value"]) != expected_version:
+        _drop_all_user_objects(conn)
+        conn.execute(
+            """
+            CREATE TABLE limsync (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO limsync(key, value) VALUES ('version', ?)",
+            (expected_version,),
+        )
+
+
 def _init_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS limsync (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+    _ensure_versioned_db(conn)
 
     conn.execute(
         """
@@ -86,38 +158,6 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         """
     )
 
-    cols = conn.execute("PRAGMA table_info(current_diffs)").fetchall()
-    col_names = {str(col["name"]) for col in cols}
-    if "metadata_detail_json" not in col_names:
-        conn.execute(
-            "ALTER TABLE current_diffs ADD COLUMN metadata_detail_json TEXT NOT NULL DEFAULT '[]'"
-        )
-    if "metadata_source" not in col_names:
-        conn.execute("ALTER TABLE current_diffs ADD COLUMN metadata_source TEXT")
-    if "left_size" not in col_names:
-        conn.execute("ALTER TABLE current_diffs ADD COLUMN left_size INTEGER")
-    if "right_size" not in col_names:
-        conn.execute("ALTER TABLE current_diffs ADD COLUMN right_size INTEGER")
-
-    meta_cols = conn.execute("PRAGMA table_info(state_meta)").fetchall()
-    meta_col_names = {str(col["name"]) for col in meta_cols}
-    if "source_endpoint" not in meta_col_names:
-        conn.execute("ALTER TABLE state_meta ADD COLUMN source_endpoint TEXT")
-    if "destination_endpoint" not in meta_col_names:
-        conn.execute("ALTER TABLE state_meta ADD COLUMN destination_endpoint TEXT")
-    if "only_left" not in meta_col_names:
-        conn.execute("ALTER TABLE state_meta ADD COLUMN only_left INTEGER")
-        if "only_local" in meta_col_names:
-            conn.execute(
-                "UPDATE state_meta SET only_left = only_local WHERE only_left IS NULL"
-            )
-    if "only_right" not in meta_col_names:
-        conn.execute("ALTER TABLE state_meta ADD COLUMN only_right INTEGER")
-        if "only_remote" in meta_col_names:
-            conn.execute(
-                "UPDATE state_meta SET only_right = only_remote WHERE only_right IS NULL"
-            )
-
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS ui_prefs (
@@ -136,26 +176,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    action_cols = conn.execute("PRAGMA table_info(scan_actions)").fetchall()
-    action_col_names = {str(col["name"]) for col in action_cols}
-    if "run_id" in action_col_names:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS scan_actions_new (
-                relpath TEXT PRIMARY KEY,
-                action TEXT NOT NULL,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO scan_actions_new(relpath, action, updated_at)
-            SELECT relpath, action, updated_at FROM scan_actions
-            """
-        )
-        conn.execute("DROP TABLE scan_actions")
-        conn.execute("ALTER TABLE scan_actions_new RENAME TO scan_actions")
+    conn.commit()
 
 
 def save_current_state(
@@ -281,9 +302,7 @@ def get_state_context(db_path: Path) -> StateContext | None:
         _init_schema(conn)
         row = conn.execute(
             """
-            SELECT
-                COALESCE(source_endpoint, local_root) AS source_endpoint,
-                COALESCE(destination_endpoint, remote_address) AS destination_endpoint
+            SELECT source_endpoint, destination_endpoint
             FROM state_meta
             WHERE singleton_id = 1
             """
@@ -302,19 +321,12 @@ def load_current_diffs(db_path: Path) -> list[dict[str, object]]:
     conn = _connect(db_path)
     try:
         _init_schema(conn)
-        cols = conn.execute("PRAGMA table_info(current_diffs)").fetchall()
-        col_names = {str(col["name"]) for col in cols}
-        left_expr = "left_size"
-        right_expr = "right_size"
-        if "local_size" in col_names:
-            left_expr = "COALESCE(left_size, local_size) AS left_size"
-        if "remote_size" in col_names:
-            right_expr = "COALESCE(right_size, remote_size) AS right_size"
         rows = conn.execute(
-            "SELECT relpath, content_state, metadata_state, metadata_diff_json, "
-            "metadata_detail_json, metadata_source, "
-            f"{left_expr}, {right_expr} "
-            "FROM current_diffs ORDER BY relpath"
+            """
+            SELECT relpath, content_state, metadata_state, metadata_diff_json, metadata_detail_json, metadata_source, left_size, right_size
+            FROM current_diffs
+            ORDER BY relpath
+            """
         ).fetchall()
         return [
             {

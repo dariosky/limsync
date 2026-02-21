@@ -133,10 +133,9 @@ def _file_label(file_entry: FileEntry) -> Text:
 
 
 def _row_to_diff(row: dict[str, object]) -> DiffRecord:
-    content_state = ContentState.from_storage(str(row["content_state"]))
     return DiffRecord(
         relpath=str(row["relpath"]),
-        content_state=content_state,
+        content_state=ContentState(str(row["content_state"])),
         metadata_state=MetadataState(str(row["metadata_state"])),
         metadata_diff=tuple(str(item) for item in row.get("metadata_diff", [])),
         metadata_details=tuple(str(item) for item in row.get("metadata_details", [])),
@@ -145,12 +144,10 @@ def _row_to_diff(row: dict[str, object]) -> DiffRecord:
             if row.get("metadata_source") is not None
             else None
         ),
-        left_size=int(row["left_size"])
-        if row.get("left_size") is not None
-        else (int(row["local_size"]) if row.get("local_size") is not None else None),
-        right_size=int(row["right_size"])
-        if row.get("right_size") is not None
-        else (int(row["remote_size"]) if row.get("remote_size") is not None else None),
+        left_size=(int(row["left_size"]) if row.get("left_size") is not None else None),
+        right_size=(
+            int(row["right_size"]) if row.get("right_size") is not None else None
+        ),
     )
 
 
@@ -204,19 +201,15 @@ def _build_model(
         file_entry = FileEntry(
             relpath=relpath,
             name=parts[-1],
-            content_state=ContentState.from_storage(str(row["content_state"])).value,
+            content_state=str(row["content_state"]),
             metadata_state=str(row["metadata_state"]),
             metadata_diff=list(row.get("metadata_diff", [])),
             metadata_details=list(row.get("metadata_details", [])),
-            left_size=int(row["left_size"])
-            if row.get("left_size") is not None
-            else (
-                int(row["local_size"]) if row.get("local_size") is not None else None
+            left_size=(
+                int(row["left_size"]) if row.get("left_size") is not None else None
             ),
-            right_size=int(row["right_size"])
-            if row.get("right_size") is not None
-            else (
-                int(row["remote_size"]) if row.get("remote_size") is not None else None
+            right_size=(
+                int(row["right_size"]) if row.get("right_size") is not None else None
             ),
         )
         current.files.append(file_entry)

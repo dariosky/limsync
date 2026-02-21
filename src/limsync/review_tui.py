@@ -70,10 +70,8 @@ def _ops_text(kinds: list[str]) -> str:
 
 def _parse_metadata_details(details: list[str]) -> dict[str, str]:
     parsed: dict[str, str] = {}
-    mode_re = re.compile(
-        r"mode:\s+(?:left|local)=(0x[0-7]{3})\s+(?:right|remote)=(0x[0-7]{3})"
-    )
-    mtime_re = re.compile(r"mtime:\s+(?:left|local)=(.*?)\s+(?:right|remote)=(.*?)$")
+    mode_re = re.compile(r"mode:\s+left=(0x[0-7]{3})\s+right=(0x[0-7]{3})")
+    mtime_re = re.compile(r"mtime:\s+left=(.*?)\s+right=(.*?)$")
     for detail in details:
         mode_match = mode_re.match(detail)
         if mode_match:

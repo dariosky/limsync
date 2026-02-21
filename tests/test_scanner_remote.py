@@ -7,3 +7,4 @@ def test_remote_helper_source_injects_shared_ignore_rules() -> None:
     source = scanner._remote_helper_source()
     assert "# [[IGNORE_RULES_SHARED]]" not in source
     assert "class IgnoreRules" in source
+    compile(source, "<stdin>", "exec")

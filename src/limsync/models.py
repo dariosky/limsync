@@ -17,15 +17,6 @@ class ContentState(str, Enum):
     ONLY_RIGHT = "only_right"
     UNKNOWN = "unknown"
 
-    @classmethod
-    def from_storage(cls, value: str) -> ContentState:
-        text = str(value)
-        if text == "only_local":
-            return cls.ONLY_LEFT
-        if text == "only_remote":
-            return cls.ONLY_RIGHT
-        return cls(text)
-
 
 class MetadataState(str, Enum):
     IDENTICAL = "identical"
