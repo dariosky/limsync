@@ -89,7 +89,7 @@ def test_save_current_state_reinitializes_when_version_missing(tmp_path) -> None
         conn.close()
 
 
-def test_load_current_diffs_reinitializes_on_version_mismatch(tmp_path) -> None:
+def test_load_current_diffs_does_not_reinitialize_on_version_mismatch(tmp_path) -> None:
     db_path = tmp_path / "state.sqlite3"
     conn = sqlite3.connect(db_path)
     try:
@@ -97,13 +97,36 @@ def test_load_current_diffs_reinitializes_on_version_mismatch(tmp_path) -> None:
         conn.execute(
             "INSERT INTO limsync(key, value) VALUES ('version', '0.0.0-test')"
         )
-        conn.execute("CREATE TABLE current_diffs (relpath TEXT PRIMARY KEY)")
+        conn.execute(
+            """
+            CREATE TABLE current_diffs (
+                relpath TEXT PRIMARY KEY,
+                content_state TEXT NOT NULL,
+                metadata_state TEXT NOT NULL,
+                metadata_diff_json TEXT NOT NULL,
+                metadata_detail_json TEXT NOT NULL DEFAULT '[]',
+                metadata_source TEXT,
+                left_size INTEGER,
+                right_size INTEGER
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO current_diffs(
+                relpath, content_state, metadata_state, metadata_diff_json, metadata_detail_json, metadata_source, left_size, right_size
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("x.txt", "only_left", "not_applicable", "[]", "[]", None, 3, None),
+        )
         conn.commit()
     finally:
         conn.close()
 
     rows = load_current_diffs(db_path)
-    assert rows == []
+    assert len(rows) == 1
+    assert rows[0]["relpath"] == "x.txt"
+    assert rows[0]["left_size"] == 3
 
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -112,12 +135,6 @@ def test_load_current_diffs_reinitializes_on_version_mismatch(tmp_path) -> None:
             "SELECT value FROM limsync WHERE key = 'version'"
         ).fetchone()
         assert version is not None
-        assert str(version["value"]) == _project_version()
-        cols = {
-            str(row["name"])
-            for row in conn.execute("PRAGMA table_info(current_diffs)").fetchall()
-        }
-        assert "left_size" in cols
-        assert "right_size" in cols
+        assert str(version["value"]) == "0.0.0-test"
     finally:
         conn.close()

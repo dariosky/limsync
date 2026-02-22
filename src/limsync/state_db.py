@@ -73,8 +73,7 @@ def _drop_all_user_objects(conn: sqlite3.Connection) -> None:
             conn.execute(f"DROP VIEW IF EXISTS {quoted}")
 
 
-def _ensure_versioned_db(conn: sqlite3.Connection) -> None:
-    expected_version = _project_version()
+def _read_db_version(conn: sqlite3.Connection) -> str | None:
     try:
         row = conn.execute(
             """
@@ -84,34 +83,42 @@ def _ensure_versioned_db(conn: sqlite3.Connection) -> None:
             """
         ).fetchone()
     except sqlite3.Error:
-        row = None
-    if row is None or str(row["value"]) != expected_version:
-        _drop_all_user_objects(conn)
-        conn.execute(
-            """
-            CREATE TABLE limsync (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute(
-            "INSERT INTO limsync(key, value) VALUES ('version', ?)",
-            (expected_version,),
-        )
+        return None
+    if row is None:
+        return None
+    return str(row["value"])
 
 
-def _init_schema(conn: sqlite3.Connection) -> None:
-    conn.execute("PRAGMA journal_mode=WAL")
+def _reinitialize_db(conn: sqlite3.Connection, version: str) -> None:
+    _drop_all_user_objects(conn)
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS limsync (
+        CREATE TABLE limsync (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         )
         """
     )
-    _ensure_versioned_db(conn)
+    conn.execute(
+        "INSERT INTO limsync(key, value) VALUES ('version', ?)",
+        (version,),
+    )
+
+
+def _migrate_db(
+    conn: sqlite3.Connection, current_version: str | None, target_version: str
+) -> None:
+    if current_version is None:
+        _reinitialize_db(conn, target_version)
+        return
+    # Placeholder for future migrations between explicit versions.
+    # For now, keep existing versioned DBs untouched.
+    _ = target_version
+
+
+def _init_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("PRAGMA journal_mode=WAL")
+    _migrate_db(conn, _read_db_version(conn), _project_version())
 
     conn.execute(
         """
