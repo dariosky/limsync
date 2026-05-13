@@ -7,6 +7,7 @@ import tempfile
 import unicodedata
 from pathlib import Path, PurePosixPath
 
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding, BindingsMap
 from textual.containers import Horizontal, Vertical
@@ -39,6 +40,7 @@ from .tree_builder import (
     _build_model,
     _file_counts,
     _file_label,
+    _folder_action_counts_by_relpath,
     _folder_label,
     _is_changed,
     _is_identical_folder,
@@ -207,6 +209,9 @@ class ReviewApp(ReviewActionsMixin, App[None]):
 
         self._reload_state()
         self.action_overrides = load_action_overrides(self.db_path)
+        self.action_counts_by_dir = _folder_action_counts_by_relpath(
+            self.dir_files_map, self.files_by_relpath, self.action_overrides
+        )
 
     def _reload_state(self) -> None:
         rows = load_current_diffs(db_path=self.db_path)
@@ -219,11 +224,18 @@ class ReviewApp(ReviewActionsMixin, App[None]):
         ) = _build_model(rows, Path(self.source_endpoint.root).name or "source")
         self.diffs = list(self.diffs_by_relpath.values())
 
+    def _folder_label_for(self, entry: DirEntry) -> Text:
+        return _folder_label(
+            entry,
+            include_identical=not self.hide_identical,
+            action_counts=self.action_counts_by_dir.get(entry.relpath),
+        )
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         with Horizontal(id="body"):
             yield Tree(
-                _folder_label(self.root, include_identical=not self.hide_identical),
+                self._folder_label_for(self.root),
                 id="tree",
             )
             with Vertical(id="side"):
@@ -255,7 +267,7 @@ class ReviewApp(ReviewActionsMixin, App[None]):
             if not self._visible_dir(child):
                 continue
             tree_node.add(
-                _folder_label(child, include_identical=not self.hide_identical),
+                self._folder_label_for(child),
                 data=("dir", child.relpath),
                 allow_expand=self._dir_has_visible_children(child),
             )
@@ -276,9 +288,10 @@ class ReviewApp(ReviewActionsMixin, App[None]):
         expanded_before, selected_before = self._capture_tree_state()
         tree = self.query_one(Tree)
         tree.root.remove_children()
-        tree.root.set_label(
-            _folder_label(self.root, include_identical=not self.hide_identical)
+        self.action_counts_by_dir = _folder_action_counts_by_relpath(
+            self.dir_files_map, self.files_by_relpath, self.action_overrides
         )
+        tree.root.set_label(self._folder_label_for(self.root))
         tree.root.data = ("dir", self.root.relpath)
         self._populate_node(tree.root, self.root)
         tree.root.expand()

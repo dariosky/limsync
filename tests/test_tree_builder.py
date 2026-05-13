@@ -1,10 +1,20 @@
-from limsync.tree_builder import DirEntry, FileEntry, FolderCounts, _file_label, _folder_label
+from limsync.tree_builder import (
+    ActionCounts,
+    DirEntry,
+    FileEntry,
+    FolderCounts,
+    _file_label,
+    _folder_action_counts_by_relpath,
+    _folder_label,
+)
 
 
-def _mk_file_entry(content_state: str, metadata_state: str = "identical") -> FileEntry:
+def _mk_file_entry(
+    content_state: str, metadata_state: str = "identical", relpath: str = "a.txt"
+) -> FileEntry:
     return FileEntry(
-        relpath="a.txt",
-        name="a.txt",
+        relpath=relpath,
+        name=relpath.rsplit("/", 1)[-1],
         content_state=content_state,
         metadata_state=metadata_state,
         metadata_diff=[],
@@ -66,6 +76,54 @@ def test_folder_label_orders_left_right_conflict_metadata_and_merges_uncertain()
         _folder_label(entry, include_identical=False).plain
         == "docs  Left 2 | Right 1 | Conflict 3 | Metadata 9"
     )
+
+
+def test_folder_label_prefers_action_counts_when_present() -> None:
+    entry = DirEntry(
+        name="docs",
+        relpath="docs",
+        counts=FolderCounts(only_left=10, only_right=10),
+    )
+
+    assert (
+        _folder_label(
+            entry,
+            action_counts=ActionCounts(left=20),
+        ).plain
+        == "docs  Left 20"
+    )
+
+
+def test_folder_label_falls_back_to_diff_counts_without_action_counts() -> None:
+    entry = DirEntry(
+        name="docs",
+        relpath="docs",
+        counts=FolderCounts(only_left=10, only_right=10),
+    )
+
+    assert _folder_label(entry, action_counts=ActionCounts()).plain == (
+        "docs  Left 10 | Right 10"
+    )
+
+
+def test_folder_action_counts_roll_up_mixed_files_by_chosen_action() -> None:
+    files_by_relpath = {
+        "docs/left-1.txt": _mk_file_entry("only_left", relpath="docs/left-1.txt"),
+        "docs/left-2.txt": _mk_file_entry("only_left", relpath="docs/left-2.txt"),
+        "docs/right-1.txt": _mk_file_entry("only_right", relpath="docs/right-1.txt"),
+        "docs/right-2.txt": _mk_file_entry("only_right", relpath="docs/right-2.txt"),
+    }
+    dir_files_map = {
+        ".": list(files_by_relpath),
+        "docs": list(files_by_relpath),
+    }
+    action_overrides = {relpath: "left_wins" for relpath in files_by_relpath}
+
+    counts = _folder_action_counts_by_relpath(
+        dir_files_map, files_by_relpath, action_overrides
+    )
+
+    assert counts["docs"] == ActionCounts(left=4)
 
 
 def test_file_label_uses_readable_badges() -> None:

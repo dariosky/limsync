@@ -20,6 +20,18 @@ class FolderCounts:
 
 
 @dataclass
+class ActionCounts:
+    left: int = 0
+    right: int = 0
+    suggested: int = 0
+    ignored: int = 0
+
+    @property
+    def total(self) -> int:
+        return self.left + self.right + self.suggested + self.ignored
+
+
+@dataclass
 class FileEntry:
     relpath: str
     name: str
@@ -90,7 +102,34 @@ def _is_changed(entry: FileEntry) -> bool:
     )
 
 
-def _folder_label(entry: DirEntry, *, include_identical: bool = True) -> Text:
+def _action_summary_parts(action_counts: ActionCounts | None) -> list[str]:
+    if action_counts is None or action_counts.total == 0:
+        return []
+
+    parts: list[str] = []
+    if action_counts.left:
+        parts.append(f"Left {action_counts.left}")
+    if action_counts.right:
+        parts.append(f"Right {action_counts.right}")
+    if action_counts.suggested:
+        parts.append(f"Suggested {action_counts.suggested}")
+    if action_counts.ignored and not parts:
+        parts.append(f"Ignored {action_counts.ignored}")
+    return parts
+
+
+def _folder_label(
+    entry: DirEntry,
+    *,
+    include_identical: bool = True,
+    action_counts: ActionCounts | None = None,
+) -> Text:
+    action_parts = _action_summary_parts(action_counts)
+    if action_parts:
+        return Text.assemble(
+            (entry.name, "bold"), "  ", (" | ".join(action_parts), "cyan")
+        )
+
     c = entry.counts
     only_left = c.only_left
     only_right = c.only_right
@@ -108,6 +147,43 @@ def _folder_label(entry: DirEntry, *, include_identical: bool = True) -> Text:
         parts.append(f"Identical {c.identical}")
     summary = " | ".join(parts) if parts else "No changes"
     return Text.assemble((entry.name, "bold"), "  ", (summary, "cyan"))
+
+
+def _action_counts_for_files(
+    relpaths: list[str],
+    files_by_relpath: dict[str, FileEntry],
+    action_overrides: dict[str, str],
+) -> ActionCounts:
+    counts = ActionCounts()
+    for relpath in relpaths:
+        entry = files_by_relpath.get(relpath)
+        if entry is None or not _is_changed(entry):
+            continue
+        action = action_overrides.get(relpath)
+        if action is None:
+            continue
+        if action == "left_wins":
+            counts.left += 1
+        elif action == "right_wins":
+            counts.right += 1
+        elif action == "suggested":
+            counts.suggested += 1
+        elif action == "ignore":
+            counts.ignored += 1
+    return counts
+
+
+def _folder_action_counts_by_relpath(
+    dir_files_map: dict[str, list[str]],
+    files_by_relpath: dict[str, FileEntry],
+    action_overrides: dict[str, str],
+) -> dict[str, ActionCounts]:
+    return {
+        relpath: _action_counts_for_files(
+            file_relpaths, files_by_relpath, action_overrides
+        )
+        for relpath, file_relpaths in dir_files_map.items()
+    }
 
 
 def _file_label(file_entry: FileEntry) -> Text:
