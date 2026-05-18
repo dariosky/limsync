@@ -489,7 +489,8 @@ class ReviewApp(ReviewActionsMixin, App[None]):
             f"Only left: {c.only_left}",
             f"Only right: {c.only_right}",
             f"Different: {c.different}",
-            f"Metadata: {c.metadata_only + c.uncertain}",
+            f"Uncertain: {c.uncertain}",
+            f"Metadata: {c.metadata_only}",
             f"Metadata fields: {meta_fields}",
             f"Identical: {c.identical}",
             "",
@@ -515,7 +516,9 @@ class ReviewApp(ReviewActionsMixin, App[None]):
             lines.append(f"Size: left={entry.left_size:,} bytes")
         elif entry.right_size is not None:
             lines.append(f"Size: right={entry.right_size:,} bytes")
-        if entry.content_state not in {"identical", "unknown"}:
+        if entry.content_state == "unknown":
+            lines.append("Content state: uncertain")
+        elif entry.content_state != "identical":
             lines.append(f"Content state: {entry.content_state}")
         if entry.metadata_state == "different":
             parsed = _parse_metadata_details(entry.metadata_details)

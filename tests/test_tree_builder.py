@@ -10,17 +10,22 @@ from limsync.tree_builder import (
 
 
 def _mk_file_entry(
-    content_state: str, metadata_state: str = "identical", relpath: str = "a.txt"
+    content_state: str,
+    metadata_state: str = "identical",
+    relpath: str = "a.txt",
+    metadata_diff: list[str] | None = None,
+    left_size: int | None = None,
+    right_size: int | None = None,
 ) -> FileEntry:
     return FileEntry(
         relpath=relpath,
         name=relpath.rsplit("/", 1)[-1],
         content_state=content_state,
         metadata_state=metadata_state,
-        metadata_diff=[],
+        metadata_diff=metadata_diff or [],
         metadata_details=[],
-        left_size=None,
-        right_size=None,
+        left_size=left_size,
+        right_size=right_size,
     )
 
 
@@ -59,7 +64,7 @@ def test_folder_label_can_hide_identical_count() -> None:
     )
 
 
-def test_folder_label_orders_left_right_conflict_metadata_and_merges_uncertain() -> None:
+def test_folder_label_orders_left_right_conflict_uncertain_and_metadata() -> None:
     entry = DirEntry(
         name="docs",
         relpath="docs",
@@ -74,7 +79,7 @@ def test_folder_label_orders_left_right_conflict_metadata_and_merges_uncertain()
 
     assert (
         _folder_label(entry, include_identical=False).plain
-        == "docs  Left 2 | Right 1 | Conflict 3 | Metadata 9"
+        == "docs  Left 2 | Right 1 | Conflict 3 | Uncertain 5 | Metadata 4"
     )
 
 
@@ -130,4 +135,20 @@ def test_file_label_uses_readable_badges() -> None:
     assert _file_label(_mk_file_entry("only_left")).plain == "a.txt  [Left] -"
     assert _file_label(_mk_file_entry("only_right")).plain == "a.txt  [Right] -"
     assert _file_label(_mk_file_entry("different")).plain == "a.txt  [Conflict] -"
-    assert _file_label(_mk_file_entry("identical", "different")).plain == "a.txt  [Metadata] -"
+    assert _file_label(_mk_file_entry("unknown")).plain == "a.txt  [Uncertain] -"
+    assert (
+        _file_label(_mk_file_entry("identical", "different")).plain
+        == "a.txt  [Metadata] -"
+    )
+
+
+def test_file_label_prioritizes_size_for_content_conflicts() -> None:
+    entry = _mk_file_entry(
+        "different",
+        "different",
+        metadata_diff=["mtime"],
+        left_size=10,
+        right_size=11,
+    )
+
+    assert _file_label(entry).plain == "a.txt  [Conflict] size"

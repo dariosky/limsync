@@ -140,9 +140,10 @@ def _folder_label(
         parts.append(f"Right {only_right}")
     if c.different:
         parts.append(f"Conflict {c.different}")
-    metadata_total = c.metadata_only + c.uncertain
-    if metadata_total:
-        parts.append(f"Metadata {metadata_total}")
+    if c.uncertain:
+        parts.append(f"Uncertain {c.uncertain}")
+    if c.metadata_only:
+        parts.append(f"Metadata {c.metadata_only}")
     if include_identical and c.identical:
         parts.append(f"Identical {c.identical}")
     summary = " | ".join(parts) if parts else "No changes"
@@ -186,6 +187,17 @@ def _folder_action_counts_by_relpath(
     }
 
 
+def _file_reason(file_entry: FileEntry) -> str:
+    if (
+        file_entry.content_state == "different"
+        and file_entry.left_size is not None
+        and file_entry.right_size is not None
+        and file_entry.left_size != file_entry.right_size
+    ):
+        return "size"
+    return ",".join(file_entry.metadata_diff) if file_entry.metadata_diff else "-"
+
+
 def _file_label(file_entry: FileEntry) -> Text:
     if file_entry.content_state == "only_left":
         badge = "Left"
@@ -202,9 +214,12 @@ def _file_label(file_entry: FileEntry) -> Text:
         badge = "Metadata"
     else:
         badge = "Identical"
-    meta = ",".join(file_entry.metadata_diff) if file_entry.metadata_diff else "-"
     return Text.assemble(
-        (file_entry.name, "white"), "  ", (f"[{badge}]", "yellow"), " ", (meta, "green")
+        (file_entry.name, "white"),
+        "  ",
+        (f"[{badge}]", "yellow"),
+        " ",
+        (_file_reason(file_entry), "green"),
     )
 
 
