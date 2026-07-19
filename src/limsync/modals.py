@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from collections.abc import Callable
 from pathlib import PurePosixPath
 
 from rich.text import Text
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, ProgressBar, Static, Tree
+from textual.widgets import Button, ProgressBar, SelectionList, Static, Tree
+from textual.widgets.selection_list import Selection
 
 from .endpoints import EndpointSpec
 from .planner_apply import ApplySettings, ExecuteResult, PlanOperation, execute_plan
+from .view_filters import VIEW_FILTER_LABELS, VIEW_FILTER_ORDER, ViewFilter
 
 
 def _op_label(kind: str) -> str:
@@ -117,10 +121,10 @@ class ConfirmApplyModal(ModalScreen[bool]):
 
 class ApplyRunModal(ModalScreen[ExecuteResult | None]):
     BINDINGS = [
-        ("escape", "close_if_done", "Close"),
+        ("escape", "cancel_or_close", "Cancel/Close"),
         ("enter", "close_if_done", "Close"),
-        ("c", "close_if_done", "Close"),
-        ("q", "close_if_done", "Close"),
+        ("c", "cancel_or_close", "Cancel/Close"),
+        ("q", "cancel_or_close", "Cancel/Close"),
     ]
     CSS = """
     Screen {
@@ -140,6 +144,9 @@ class ApplyRunModal(ModalScreen[ExecuteResult | None]):
     }
     #apply-progress {
         width: 100%;
+    }
+    #apply-progress > Bar {
+        width: 1fr;
     }
     #errors {
         height: 12;
@@ -169,6 +176,7 @@ class ApplyRunModal(ModalScreen[ExecuteResult | None]):
         self.apply_settings = apply_settings or ApplySettings()
         self.progress_event_cb = progress_event_cb
         self.result: ExecuteResult | None = None
+        self.cancel_event = threading.Event()
 
     def compose(self) -> ComposeResult:
         with Container(id="apply-root"):
@@ -178,8 +186,9 @@ class ApplyRunModal(ModalScreen[ExecuteResult | None]):
                     total=len(self.operations), show_eta=False, id="apply-progress"
                 )
                 yield Static("Errors:\n-", id="errors")
-                with Container(id="apply-close-row"):
-                    yield Button("Running...", id="close", disabled=True)
+                with Horizontal(id="apply-close-row"):
+                    yield Button("Cancel [C]", id="cancel-apply")
+                    yield Button("Close", id="close", disabled=True)
 
     def on_mount(self) -> None:
         self.run_worker(self._run_apply(), exclusive=True)
@@ -213,6 +222,7 @@ class ApplyRunModal(ModalScreen[ExecuteResult | None]):
                 self.operations,
                 progress_cb,
                 self.apply_settings,
+                self.cancel_event,
             )
             self.result = result
             top_costly = sorted(
@@ -226,9 +236,17 @@ class ApplyRunModal(ModalScreen[ExecuteResult | None]):
                     f"{kind}={seconds:.2f}s ({result.operation_counts.get(kind, 0)})"
                     for kind, seconds in top_costly
                 )
-            self.query_one("#apply-status", Static).update(
-                f"Completed {result.succeeded_operations}/{result.total_operations} operations.{timing_suffix}"
-            )
+            if result.cancelled:
+                final_status = (
+                    f"Cancelled after {result.succeeded_operations}/"
+                    f"{result.total_operations} operations."
+                )
+            else:
+                final_status = (
+                    f"Completed {result.succeeded_operations}/"
+                    f"{result.total_operations} operations.{timing_suffix}"
+                )
+            self.query_one("#apply-status", Static).update(final_status)
             if result.errors:
                 error_text = "Errors:\n" + "\n".join(result.errors[:100])
             else:
@@ -245,6 +263,8 @@ class ApplyRunModal(ModalScreen[ExecuteResult | None]):
             self.query_one("#errors", Static).update(f"Errors:\n{exc}")
 
         close_btn = self.query_one("#close", Button)
+        cancel_btn = self.query_one("#cancel-apply", Button)
+        cancel_btn.disabled = True
         close_btn.disabled = False
         close_btn.label = "Close"
         close_btn.focus()
@@ -263,8 +283,29 @@ class ApplyRunModal(ModalScreen[ExecuteResult | None]):
             self.progress_event_cb(done, total, op, ok, error)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel-apply" and not event.button.disabled:
+            self.action_request_cancel()
+            return
         if event.button.id == "close" and not event.button.disabled:
             self.dismiss(self.result)
+
+    def action_request_cancel(self) -> None:
+        if self.result is not None or self.cancel_event.is_set():
+            return
+        self.cancel_event.set()
+        cancel_btn = self.query_one("#cancel-apply", Button)
+        cancel_btn.disabled = True
+        cancel_btn.label = "Cancelling..."
+        self.query_one("#apply-status", Static).update(
+            "Cancelling after current operation..."
+        )
+
+    def action_cancel_or_close(self) -> None:
+        close_btn = self.query_one("#close", Button)
+        if not close_btn.disabled:
+            self.dismiss(self.result)
+            return
+        self.action_request_cancel()
 
     def action_close_if_done(self) -> None:
         close_btn = self.query_one("#close", Button)
@@ -431,6 +472,87 @@ class FileDiffModal(ModalScreen[None]):
         self.dismiss(None)
 
 
+class ViewFiltersModal(ModalScreen[set[ViewFilter] | None]):
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        Binding("enter", "apply", "Apply", priority=True),
+    ]
+    CSS = """
+    Screen {
+        background: $background 70%;
+    }
+    #filters-root {
+        width: 100%;
+        height: 100%;
+        align: center middle;
+    }
+    #filters-box {
+        width: 64;
+        height: auto;
+        border: round #666666;
+        padding: 1 2;
+    }
+    #filters-title {
+        height: auto;
+    }
+    #filters-list {
+        height: auto;
+        max-height: 16;
+        border: round #444444;
+    }
+    #filters-buttons {
+        width: 100%;
+        height: auto;
+        align: center middle;
+    }
+    """
+
+    def __init__(
+        self,
+        counts: dict[ViewFilter, int],
+        enabled: set[ViewFilter],
+    ) -> None:
+        super().__init__()
+        self.counts = counts
+        self.enabled = set(enabled)
+
+    def compose(self) -> ComposeResult:
+        selections = [
+            Selection(
+                f"{VIEW_FILTER_LABELS[category]} ({self.counts.get(category, 0)})",
+                category,
+                category in self.enabled,
+            )
+            for category in VIEW_FILTER_ORDER
+        ]
+        with Container(id="filters-root"):
+            with Vertical(id="filters-box"):
+                yield Static(
+                    "Filter review tree\nSpace toggles a category; Enter applies.",
+                    id="filters-title",
+                )
+                yield SelectionList(*selections, id="filters-list")
+                with Horizontal(id="filters-buttons"):
+                    yield Button("Cancel [Esc]", id="cancel")
+                    yield Button("Apply [Enter]", id="apply")
+
+    def on_mount(self) -> None:
+        self.query_one("#filters-list", SelectionList).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply":
+            self.action_apply()
+        else:
+            self.action_cancel()
+
+    def action_apply(self) -> None:
+        selected = self.query_one("#filters-list", SelectionList).selected
+        self.dismiss(set(selected))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class CommandsModal(ModalScreen[str | None]):
     BINDINGS = [
         ("escape", "close", "Close"),
@@ -469,10 +591,11 @@ class CommandsModal(ModalScreen[str | None]):
 
     COMMANDS: list[tuple[str, str]] = [
         ("h", "toggle_hide_identical"),
+        ("f", "show_view_filters"),
         ("o", "open_selected"),
         ("U", "update_selected_path"),
         ("D", "delete_selected_both"),
-        ("F", "diff_selected"),
+        ("d", "diff_selected"),
         ("P", "copy_selected_path"),
         ("V", "view_plan"),
         ("I", "add_to_dropboxignore"),
@@ -488,10 +611,11 @@ class CommandsModal(ModalScreen[str | None]):
         rows: list[str] = ["Advanced Commands", ""]
         descriptions = {
             "h": "show/hide identical",
+            "f": "filter review tree",
             "o": "open",
             "U": "rescan selected path",
             "D": "delete file/folder both sides",
-            "F": "diff",
+            "d": "diff",
             "P": "copy path",
             "V": "view plan",
             "I": "add ignore rule",

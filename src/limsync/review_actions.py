@@ -19,6 +19,7 @@ from .modals import (
     FileDiffModal,
     OpenSideModal,
     PlanTreeModal,
+    ViewFiltersModal,
 )
 from .models import ContentState
 from .planner_apply import (
@@ -39,6 +40,7 @@ from .state_db import (
     set_ui_pref,
     upsert_action_overrides,
 )
+from .view_filters import ViewFilter, count_view_filters
 
 
 class ReviewActionsMixin:
@@ -92,7 +94,14 @@ class ReviewActionsMixin:
             for op in self._pending_apply_ops
             if (op.kind, op.relpath) not in result.succeeded_operation_keys
         ]
-        if result.errors:
+        if result.cancelled:
+            self.status_message = (
+                f"Cancelled after applying {result.succeeded_operations}/"
+                f"{result.total_operations} operations."
+            )
+            if result.errors:
+                self.status_message += f" {len(result.errors)} errors."
+        elif result.errors:
             self.status_message = (
                 f"Applied {result.succeeded_operations}/{result.total_operations} operations."
                 f" {len(result.errors)} errors."
@@ -452,6 +461,10 @@ class ReviewActionsMixin:
         relpaths = (
             [relpath] if kind == "file" else list(self.dir_files_map.get(relpath, []))
         )
+        if kind == "dir":
+            relpaths = [
+                path for path in relpaths if path in self.visible_changed_relpaths
+            ]
 
         ops_by_key: dict[tuple[str, str], PlanOperation] = {}
         for target_relpath in relpaths:
@@ -578,6 +591,34 @@ class ReviewActionsMixin:
 
     def action_show_commands(self) -> None:
         self.push_screen(CommandsModal(), callback=self._on_command_chosen)
+
+    def action_show_view_filters(self) -> None:
+        self.push_screen(
+            ViewFiltersModal(
+                count_view_filters(self.diffs),
+                self.enabled_view_filters,
+            ),
+            callback=self._on_view_filters_chosen,
+        )
+
+    def _on_view_filters_chosen(self, enabled: set[ViewFilter] | None) -> None:
+        if enabled is None:
+            return
+        self.enabled_view_filters = set(enabled)
+        self.status_message = (
+            f"Showing {len(enabled)} of {len(count_view_filters(self.diffs))} filters."
+        )
+        self._rebuild_tree()
+        selected = self._current_selection()
+        if selected is None:
+            self._set_info_for_dir(self.root)
+        elif selected[0] == "dir":
+            self._set_info_for_dir(self.dirs_by_relpath.get(selected[1], self.root))
+        else:
+            entry = self.files_by_relpath.get(selected[1])
+            if entry is not None:
+                self._set_info_for_file(entry)
+        self._update_plan_panel()
 
     def _read_text_lines_for_diff(
         self, file_path: Path, side_label: str

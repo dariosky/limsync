@@ -123,6 +123,7 @@ def _folder_label(
     *,
     include_identical: bool = True,
     action_counts: ActionCounts | None = None,
+    counts: FolderCounts | None = None,
 ) -> Text:
     action_parts = _action_summary_parts(action_counts)
     if action_parts:
@@ -130,7 +131,7 @@ def _folder_label(
             (entry.name, "bold"), "  ", (" | ".join(action_parts), "cyan")
         )
 
-    c = entry.counts
+    c = counts or entry.counts
     only_left = c.only_left
     only_right = c.only_right
     parts: list[str] = []
@@ -178,13 +179,39 @@ def _folder_action_counts_by_relpath(
     dir_files_map: dict[str, list[str]],
     files_by_relpath: dict[str, FileEntry],
     action_overrides: dict[str, str],
+    included_relpaths: set[str] | None = None,
 ) -> dict[str, ActionCounts]:
     return {
         relpath: _action_counts_for_files(
-            file_relpaths, files_by_relpath, action_overrides
+            (
+                file_relpaths
+                if included_relpaths is None
+                else [path for path in file_relpaths if path in included_relpaths]
+            ),
+            files_by_relpath,
+            action_overrides,
         )
         for relpath, file_relpaths in dir_files_map.items()
     }
+
+
+def _folder_counts_by_relpath(
+    dir_files_map: dict[str, list[str]],
+    files_by_relpath: dict[str, FileEntry],
+    included_changed_relpaths: set[str],
+) -> dict[str, FolderCounts]:
+    counts_by_dir: dict[str, FolderCounts] = {}
+    for dir_relpath, file_relpaths in dir_files_map.items():
+        counts = FolderCounts()
+        for file_relpath in file_relpaths:
+            entry = files_by_relpath.get(file_relpath)
+            if entry is None:
+                continue
+            if _is_changed(entry) and file_relpath not in included_changed_relpaths:
+                continue
+            _apply_counts(counts, _file_counts(entry))
+        counts_by_dir[dir_relpath] = counts
+    return counts_by_dir
 
 
 def _file_reason(file_entry: FileEntry) -> str:

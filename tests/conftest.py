@@ -168,6 +168,17 @@ class FakeSFTPClient:
             return
         raise FileNotFoundError(f"remote missing: {remote_path}")
 
+    def posix_rename(self, oldpath: str, newpath: str) -> None:
+        self._check_failure("posix_rename", newpath)
+        self.calls.append(("posix_rename", oldpath, newpath))
+        if oldpath not in self.remote_files:
+            raise FileNotFoundError(f"remote missing: {oldpath}")
+        self.remote_files[newpath] = self.remote_files.pop(oldpath)
+        if oldpath in self.remote_stats:
+            self.remote_stats[newpath] = self.remote_stats.pop(oldpath)
+        self.remote_lstats.pop(newpath, None)
+        self.remote_symlinks.pop(newpath, None)
+
     def chmod(self, path: str, mode: int) -> None:
         self._check_failure("chmod", path)
         self.calls.append(("chmod", path, mode))

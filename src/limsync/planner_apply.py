@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import tempfile
+import threading
 import time
+import uuid
 from collections.abc import Callable
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -33,6 +37,7 @@ type StatLike = os.stat_result | paramiko.SFTPAttributes
 class PlanOperation:
     kind: str
     relpath: str
+    metadata_fields: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -67,6 +72,7 @@ class ExecuteResult:
     )
     operation_counts: dict[str, int] = field(default_factory=dict)
     operation_seconds: dict[str, float] = field(default_factory=dict)
+    cancelled: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,12 +165,16 @@ def _suggested_metadata_op(relpath: str, diff: DiffRecord) -> list[PlanOperation
 def _metadata_ops(relpath: str, action: str, diff: DiffRecord) -> list[PlanOperation]:
     if diff.metadata_state != MetadataState.DIFFERENT:
         return []
+    fields = tuple(field for field in diff.metadata_diff if field in {"mode", "mtime"})
     if action == ACTION_LEFT_WINS:
-        return [PlanOperation("metadata_update_right", relpath)]
+        return [PlanOperation("metadata_update_right", relpath, fields)]
     if action == ACTION_RIGHT_WINS:
-        return [PlanOperation("metadata_update_left", relpath)]
+        return [PlanOperation("metadata_update_left", relpath, fields)]
     if action == ACTION_SUGGESTED:
-        return _suggested_metadata_op(relpath, diff)
+        return [
+            PlanOperation(op.kind, op.relpath, fields)
+            for op in _suggested_metadata_op(relpath, diff)
+        ]
     return []
 
 
@@ -207,8 +217,10 @@ def build_plan_operations(
         if diff.content_state in {ContentState.DIFFERENT, ContentState.UNKNOWN}:
             if action == ACTION_LEFT_WINS:
                 ops.append(PlanOperation("copy_right", diff.relpath))
+                continue
             elif action == ACTION_RIGHT_WINS:
                 ops.append(PlanOperation("copy_left", diff.relpath))
+                continue
             if (
                 diff.content_state == ContentState.DIFFERENT
                 and action == ACTION_SUGGESTED
@@ -363,6 +375,35 @@ def _remove_remote_if_exists(sftp: paramiko.SFTPClient, path: str) -> None:
         sftp.remove(path)
     except OSError:
         return
+
+
+def _put_remote_with_replace_fallback(
+    sftp: paramiko.SFTPClient,
+    local_path: str,
+    remote_path: str,
+    *,
+    confirm: bool,
+) -> None:
+    try:
+        sftp.put(local_path, remote_path, confirm=confirm)
+        return
+    except Exception as direct_error:  # noqa: BLE001
+        parent = os.path.dirname(remote_path)
+        filename = os.path.basename(remote_path)
+        temporary_name = f".{filename}.limsync-{uuid.uuid4().hex}.tmp"
+        temporary_path = (
+            f"{parent.rstrip('/')}/{temporary_name}" if parent else temporary_name
+        )
+
+        try:
+            sftp.put(local_path, temporary_path, confirm=confirm)
+            sftp.posix_rename(temporary_path, remote_path)
+        except Exception as replacement_error:  # noqa: BLE001
+            _remove_remote_if_exists(sftp, temporary_path)
+            raise RuntimeError(
+                f"direct upload failed ({direct_error}); "
+                f"temporary replacement failed ({replacement_error})"
+            ) from replacement_error
 
 
 def _coerce_endpoint(value: EndpointSpec | str | Path) -> EndpointSpec:
@@ -589,7 +630,8 @@ def _copy_between(
         assert isinstance(src_path, Path)
         assert isinstance(dst_path, str)
         assert destination_side.remote is not None
-        destination_side.remote.sftp.put(
+        _put_remote_with_replace_fallback(
+            destination_side.remote.sftp,
             str(src_path),
             dst_path,
             confirm=settings.sftp_put_confirm,
@@ -620,7 +662,8 @@ def _copy_between(
         tmp_path = Path(handle.name)
     try:
         source_side.remote.sftp.get(src_path, str(tmp_path))
-        destination_side.remote.sftp.put(
+        _put_remote_with_replace_fallback(
+            destination_side.remote.sftp,
             str(tmp_path),
             dst_path,
             confirm=settings.sftp_put_confirm,
@@ -696,6 +739,319 @@ def _apply_metadata_from_left_to_right(
     )
 
 
+def _remote_metadata_helper_source() -> str:
+    return (
+        Path(__file__)
+        .with_name("remote_metadata_helper.py")
+        .read_text(encoding="utf-8")
+    )
+
+
+def _write_remote_metadata_requests(
+    stdin,
+    requests: list[dict[str, object]],
+    cancel_event: threading.Event | None = None,
+) -> None:
+    try:
+        chunk: list[str] = []
+        for request in requests:
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            chunk.append(json.dumps(request, ensure_ascii=True) + "\n")
+            if len(chunk) >= 500:
+                stdin.write("".join(chunk))
+                stdin.flush()
+                chunk.clear()
+        if chunk:
+            stdin.write("".join(chunk))
+            stdin.flush()
+    finally:
+        channel = getattr(stdin, "channel", None)
+        if channel is not None:
+            channel.shutdown_write()
+        else:
+            stdin.close()
+
+
+def _run_remote_metadata_helper(
+    remote: _RemoteRuntime,
+    mode: str,
+    requests: list[dict[str, object]],
+    response_cb: Callable[[dict[str, object]], None] | None = None,
+    cancel_event: threading.Event | None = None,
+) -> tuple[dict[int, dict[str, object]], str | None]:
+    helper_source = _remote_metadata_helper_source()
+    command = (
+        f"python3 -c {shlex.quote(helper_source)} "
+        f"--mode {shlex.quote(mode)} --root {shlex.quote(remote.root)}"
+    )
+    stdin, stdout, stderr = remote.client.exec_command(command)
+    write_errors: list[str] = []
+
+    def write_requests() -> None:
+        try:
+            _write_remote_metadata_requests(stdin, requests, cancel_event)
+        except Exception as exc:  # noqa: BLE001
+            write_errors.append(str(exc))
+
+    writer = threading.Thread(target=write_requests, daemon=True)
+    writer.start()
+
+    remote_pid: list[int] = []
+    pid_ready = threading.Event()
+    monitor_stop = threading.Event()
+
+    def signal_cancel() -> None:
+        if cancel_event is None:
+            return
+        while not monitor_stop.wait(0.05):
+            if cancel_event.is_set():
+                break
+        if monitor_stop.is_set():
+            return
+        while not monitor_stop.is_set() and not pid_ready.wait(0.05):
+            pass
+        if monitor_stop.is_set() or not remote_pid:
+            return
+        try:
+            _cancel_stdin, cancel_stdout, _cancel_stderr = remote.client.exec_command(
+                f"kill -USR1 {remote_pid[0]}"
+            )
+            cancel_stdout.channel.recv_exit_status()
+        except Exception:
+            # Closing stdin still prevents more work from being queued. Any requests
+            # already accepted by the helper finish normally.
+            return
+
+    cancel_monitor = threading.Thread(target=signal_cancel, daemon=True)
+    cancel_monitor.start()
+
+    responses: dict[int, dict[str, object]] = {}
+    protocol_errors: list[str] = []
+    for raw_line in iter(stdout.readline, ""):
+        if isinstance(raw_line, bytes):
+            raw_line = raw_line.decode("utf-8", errors="replace")
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            protocol_errors.append(f"invalid JSON response: {line[:120]}")
+            continue
+        if not isinstance(event, dict):
+            protocol_errors.append("metadata helper returned a non-object response")
+            continue
+        if event.get("event") == "ready":
+            pid = event.get("pid")
+            if isinstance(pid, int):
+                remote_pid.append(pid)
+                pid_ready.set()
+            continue
+        if event.get("event") == "done":
+            continue
+        if event.get("event") == "fatal":
+            protocol_errors.append(str(event.get("error", "remote helper failed")))
+            continue
+        request_id = event.get("id")
+        if not isinstance(request_id, int):
+            protocol_errors.append("metadata helper response is missing an integer id")
+            continue
+        if response_cb is not None:
+            response_cb(event)
+        else:
+            responses[request_id] = event
+
+    writer.join()
+    monitor_stop.set()
+    pid_ready.set()
+    cancel_monitor.join()
+    exit_status = stdout.channel.recv_exit_status()
+    stderr_output = stderr.read()
+    if isinstance(stderr_output, bytes):
+        stderr_output = stderr_output.decode("utf-8", errors="replace")
+    stderr_text = str(stderr_output).strip()
+
+    errors = list(write_errors)
+    errors.extend(protocol_errors)
+    cancelled = cancel_event is not None and cancel_event.is_set()
+    if exit_status != 0 and not cancelled:
+        errors.append(f"remote metadata helper exited with status {exit_status}")
+    if stderr_text:
+        errors.append(f"remote metadata helper stderr: {stderr_text}")
+    return responses, "; ".join(errors) if errors else None
+
+
+def _operation_metadata_fields(op: PlanOperation) -> tuple[str, ...]:
+    return op.metadata_fields or ("mode", "mtime")
+
+
+def _read_metadata_batch(
+    source_side: _SideRuntime,
+    operations: list[PlanOperation],
+    cancel_event: threading.Event,
+) -> tuple[dict[int, dict[str, object]], dict[int, str]]:
+    values: dict[int, dict[str, object]] = {}
+    errors: dict[int, str] = {}
+    if source_side.is_local:
+        for request_id, op in enumerate(operations):
+            if cancel_event.is_set():
+                break
+            try:
+                source_stat = _side_lstat(source_side, op.relpath)
+                if _is_symlink(source_stat):
+                    values[request_id] = {"noop": True}
+                    continue
+                fields = _operation_metadata_fields(op)
+                item: dict[str, object] = {}
+                if "mode" in fields:
+                    item["mode"] = _local_mode(source_stat)
+                if "mtime" in fields:
+                    item["mtime_ns"] = _local_mtime_ns(source_stat)
+                values[request_id] = item
+            except Exception as exc:  # noqa: BLE001
+                errors[request_id] = str(exc)
+        return values, errors
+
+    assert source_side.remote is not None
+    requests = [
+        {
+            "id": request_id,
+            "relpath": op.relpath,
+            "fields": list(_operation_metadata_fields(op)),
+        }
+        for request_id, op in enumerate(operations)
+    ]
+    responses, helper_error = _run_remote_metadata_helper(
+        source_side.remote, "read", requests, cancel_event=cancel_event
+    )
+    for request_id, _op in enumerate(operations):
+        response = responses.get(request_id)
+        if response is None:
+            if cancel_event.is_set():
+                continue
+            errors[request_id] = (
+                helper_error or "remote metadata helper returned no response"
+            )
+        elif not response.get("ok"):
+            errors[request_id] = str(
+                response.get("error", "remote metadata read failed")
+            )
+        elif response.get("noop"):
+            values[request_id] = {"noop": True}
+        else:
+            values[request_id] = response
+    return values, errors
+
+
+def _apply_local_metadata_values(
+    destination_side: _SideRuntime,
+    op: PlanOperation,
+    values: dict[str, object],
+) -> None:
+    target_stat = _side_lstat(destination_side, op.relpath)
+    if _is_symlink(target_stat):
+        return
+    target_path = _side_path(destination_side, op.relpath)
+    assert isinstance(target_path, Path)
+    fields = _operation_metadata_fields(op)
+    if "mode" in fields:
+        os.chmod(target_path, int(values["mode"]))
+    if "mtime" in fields:
+        os.utime(
+            target_path,
+            ns=(int(getattr(target_stat, "st_atime_ns")), int(values["mtime_ns"])),
+        )
+
+
+def _execute_metadata_batch(
+    source_side: _SideRuntime,
+    destination_side: _SideRuntime,
+    operations: list[PlanOperation],
+    result_cb: Callable[[PlanOperation, bool, str | None], None],
+    cancel_event: threading.Event,
+) -> None:
+    values, read_errors = _read_metadata_batch(source_side, operations, cancel_event)
+    ready: list[tuple[int, PlanOperation, dict[str, object]]] = []
+    for request_id, op in enumerate(operations):
+        if cancel_event.is_set():
+            break
+        error = read_errors.get(request_id)
+        if error is not None:
+            result_cb(op, False, error)
+            continue
+        item = values.get(request_id)
+        if item is None:
+            continue
+        if item.get("noop"):
+            result_cb(op, True, None)
+            continue
+        ready.append((request_id, op, item))
+
+    if destination_side.is_local:
+        for _request_id, op, item in ready:
+            if cancel_event.is_set():
+                break
+            try:
+                _apply_local_metadata_values(destination_side, op, item)
+                result_cb(op, True, None)
+            except Exception as exc:  # noqa: BLE001
+                result_cb(op, False, str(exc))
+        return
+
+    if not ready:
+        return
+
+    assert destination_side.remote is not None
+    ready_by_id = {request_id: op for request_id, op, _item in ready}
+    requests: list[dict[str, object]] = []
+    for request_id, op, item in ready:
+        request = {
+            "id": request_id,
+            "relpath": op.relpath,
+            "fields": list(_operation_metadata_fields(op)),
+        }
+        request.update(item)
+        requests.append(request)
+
+    reported: set[int] = set()
+
+    def on_response(response: dict[str, object]) -> None:
+        request_id = response.get("id")
+        if (
+            not isinstance(request_id, int)
+            or request_id not in ready_by_id
+            or request_id in reported
+        ):
+            return
+        reported.add(request_id)
+        if response.get("ok"):
+            result_cb(ready_by_id[request_id], True, None)
+        else:
+            result_cb(
+                ready_by_id[request_id],
+                False,
+                str(response.get("error", "remote metadata apply failed")),
+            )
+
+    _responses, helper_error = _run_remote_metadata_helper(
+        destination_side.remote,
+        "apply",
+        requests,
+        response_cb=on_response,
+        cancel_event=cancel_event,
+    )
+    for request_id, op in ready_by_id.items():
+        if request_id not in reported:
+            if cancel_event.is_set():
+                continue
+            result_cb(
+                op,
+                False,
+                helper_error or "remote metadata helper returned no response",
+            )
+
+
 def execute_plan(
     source: EndpointSpec | str | Path,
     destination: EndpointSpec | str | Path,
@@ -703,11 +1059,13 @@ def execute_plan(
     progress_cb: Callable[[int, int, PlanOperation, bool, str | None], None]
     | None = None,
     settings: ApplySettings | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> ExecuteResult:
     source_endpoint = _coerce_endpoint(source)
     destination_endpoint = _coerce_endpoint(destination)
     local_home = Path.home().expanduser().resolve()
     resolved_settings = settings or ApplySettings()
+    resolved_cancel_event = cancel_event or threading.Event()
 
     if not operations:
         return ExecuteResult(
@@ -715,6 +1073,15 @@ def execute_plan(
             errors=[],
             succeeded_operations=0,
             total_operations=0,
+        )
+
+    if resolved_cancel_event.is_set():
+        return ExecuteResult(
+            completed_paths=set(),
+            errors=[],
+            succeeded_operations=0,
+            total_operations=len(operations),
+            cancelled=True,
         )
 
     path_ops: dict[str, list[PlanOperation]] = {}
@@ -749,7 +1116,38 @@ def execute_plan(
             normalized_remote_root = side.remote.root.rstrip("/") or "/"
             known_remote_dirs[id(side.remote.sftp)] = {"/", normalized_remote_root}
 
+        batch_groups: dict[str, list[PlanOperation]] = {}
+        regular_operations: list[PlanOperation] = []
         for op in operations:
+            same_path_ops = path_ops.get(op.relpath, [])
+            if (
+                op.kind in {"metadata_update_left", "metadata_update_right"}
+                and len(same_path_ops) == 1
+            ):
+                batch_groups.setdefault(op.kind, []).append(op)
+            else:
+                regular_operations.append(op)
+
+        def record_result(
+            op: PlanOperation,
+            ok: bool,
+            error: str | None,
+            elapsed: float = 0.0,
+        ) -> None:
+            nonlocal done_count
+            op_counts[op.kind] = op_counts.get(op.kind, 0) + 1
+            op_seconds[op.kind] = op_seconds.get(op.kind, 0.0) + elapsed
+            if ok:
+                succeeded.add((op.kind, op.relpath))
+            elif error:
+                errors.append(f"{op.kind} {op.relpath}: {error}")
+            done_count += 1
+            if progress_cb is not None:
+                progress_cb(done_count, total, op, ok, error)
+
+        for op in regular_operations:
+            if resolved_cancel_event.is_set():
+                break
             relpath = op.relpath
             ok = False
             error: str | None = None
@@ -807,17 +1205,28 @@ def execute_plan(
                 error = str(exc)
             finally:
                 elapsed = time.perf_counter() - started
-                op_counts[op.kind] = op_counts.get(op.kind, 0) + 1
-                op_seconds[op.kind] = op_seconds.get(op.kind, 0.0) + elapsed
+            record_result(op, ok, error, elapsed)
 
-            if ok:
-                succeeded.add((op.kind, op.relpath))
-            elif error:
-                errors.append(f"{op.kind} {op.relpath}: {error}")
-
-            done_count += 1
-            if progress_cb is not None:
-                progress_cb(done_count, total, op, ok, error)
+        for kind, metadata_operations in batch_groups.items():
+            if resolved_cancel_event.is_set():
+                break
+            batch_started = time.perf_counter()
+            if kind == "metadata_update_left":
+                metadata_source = right_side
+                metadata_destination = left_side
+            else:
+                metadata_source = left_side
+                metadata_destination = right_side
+            _execute_metadata_batch(
+                metadata_source,
+                metadata_destination,
+                metadata_operations,
+                record_result,
+                resolved_cancel_event,
+            )
+            op_seconds[kind] = op_seconds.get(kind, 0.0) + (
+                time.perf_counter() - batch_started
+            )
 
     completed_paths: set[str] = set()
     for relpath, path_operations in path_ops.items():
@@ -832,4 +1241,5 @@ def execute_plan(
         succeeded_operation_keys=frozenset(succeeded),
         operation_counts=op_counts,
         operation_seconds=op_seconds,
+        cancelled=resolved_cancel_event.is_set() and done_count < total,
     )

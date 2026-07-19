@@ -41,10 +41,12 @@ from .tree_builder import (
     _file_counts,
     _file_label,
     _folder_action_counts_by_relpath,
+    _folder_counts_by_relpath,
     _folder_label,
     _is_changed,
     _is_identical_folder,
 )
+from .view_filters import ALL_VIEW_FILTERS, ViewFilter, classify_diff_for_view
 
 
 def _op_label(kind: str) -> str:
@@ -167,11 +169,12 @@ class ReviewApp(ReviewActionsMixin, App[None]):
         Binding("q", "quit", "Quit"),
         Binding("question_mark", "show_commands", "Commands"),
         Binding("h", "toggle_hide_identical", "Hide Identical", show=False),
+        Binding("f", "show_view_filters", "Filters", show=False),
         Binding("enter", "toggle_cursor_node", "Open/Close"),
         Binding("o", "open_selected", "Open", show=False),
         Binding("U", "update_selected_path", "Update Path", show=False),
         Binding("D", "delete_selected_both", "Delete Both", show=False),
-        Binding("F", "diff_selected", "Diff", show=False),
+        Binding("d", "diff_selected", "Diff", show=False),
         Binding("P", "copy_selected_path", "Copy Path", show=False),
         Binding("V", "view_plan", "View Plan", show=False),
         Binding("C", "clear_plan", "Clear Plan", show=False),
@@ -197,6 +200,7 @@ class ReviewApp(ReviewActionsMixin, App[None]):
         self.source_endpoint = source_endpoint
         self.destination_endpoint = destination_endpoint
         self.hide_identical = hide_identical
+        self.enabled_view_filters: set[ViewFilter] = set(ALL_VIEW_FILTERS)
         self.apply_settings = apply_settings or ApplySettings()
         self.status_message = ""
         self.can_apply = False
@@ -209,9 +213,7 @@ class ReviewApp(ReviewActionsMixin, App[None]):
 
         self._reload_state()
         self.action_overrides = load_action_overrides(self.db_path)
-        self.action_counts_by_dir = _folder_action_counts_by_relpath(
-            self.dir_files_map, self.files_by_relpath, self.action_overrides
-        )
+        self._refresh_view_aggregates()
 
     def _reload_state(self) -> None:
         rows = load_current_diffs(db_path=self.db_path)
@@ -224,11 +226,30 @@ class ReviewApp(ReviewActionsMixin, App[None]):
         ) = _build_model(rows, Path(self.source_endpoint.root).name or "source")
         self.diffs = list(self.diffs_by_relpath.values())
 
+    def _refresh_view_aggregates(self) -> None:
+        self.visible_changed_relpaths = {
+            relpath
+            for relpath, diff in self.diffs_by_relpath.items()
+            if classify_diff_for_view(diff) in self.enabled_view_filters
+        }
+        self.display_counts_by_dir = _folder_counts_by_relpath(
+            self.dir_files_map,
+            self.files_by_relpath,
+            self.visible_changed_relpaths,
+        )
+        self.action_counts_by_dir = _folder_action_counts_by_relpath(
+            self.dir_files_map,
+            self.files_by_relpath,
+            self.action_overrides,
+            included_relpaths=self.visible_changed_relpaths,
+        )
+
     def _folder_label_for(self, entry: DirEntry) -> Text:
         return _folder_label(
             entry,
             include_identical=not self.hide_identical,
             action_counts=self.action_counts_by_dir.get(entry.relpath),
+            counts=self.display_counts_by_dir.get(entry.relpath),
         )
 
     def compose(self) -> ComposeResult:
@@ -250,10 +271,22 @@ class ReviewApp(ReviewActionsMixin, App[None]):
         self._update_plan_panel()
 
     def _visible_dir(self, entry: DirEntry) -> bool:
-        return True if not self.hide_identical else not _is_identical_folder(entry)
+        counts = self.display_counts_by_dir.get(entry.relpath, entry.counts)
+        has_visible_changes = any(
+            (
+                counts.only_left,
+                counts.only_right,
+                counts.metadata_only,
+                counts.different,
+                counts.uncertain,
+            )
+        )
+        if has_visible_changes:
+            return True
+        return not self.hide_identical and _is_identical_folder(entry)
 
     def _visible_file(self, entry: FileEntry) -> bool:
-        return _is_changed(entry)
+        return entry.relpath in self.visible_changed_relpaths
 
     def _dir_has_visible_children(self, entry: DirEntry) -> bool:
         return any(self._visible_dir(child) for child in entry.dirs.values()) or any(
@@ -288,9 +321,7 @@ class ReviewApp(ReviewActionsMixin, App[None]):
         expanded_before, selected_before = self._capture_tree_state()
         tree = self.query_one(Tree)
         tree.root.remove_children()
-        self.action_counts_by_dir = _folder_action_counts_by_relpath(
-            self.dir_files_map, self.files_by_relpath, self.action_overrides
-        )
+        self._refresh_view_aggregates()
         tree.root.set_label(self._folder_label_for(self.root))
         tree.root.data = ("dir", self.root.relpath)
         self._populate_node(tree.root, self.root)
@@ -348,14 +379,21 @@ class ReviewApp(ReviewActionsMixin, App[None]):
             return None
 
         expand_dir_node(tree.root)
-        if selected is not None:
-            selected_node = find_node_by_data(tree.root, selected)
-            if selected_node is not None:
-                tree.select_node(selected_node)
-                line = getattr(selected_node, "line", None)
-                if isinstance(line, int):
-                    tree.move_cursor_to_line(line, animate=False)
-                tree.scroll_to_node(selected_node)
+        selected_node = None
+        candidate = selected
+        while candidate is not None and selected_node is None:
+            selected_node = find_node_by_data(tree.root, candidate)
+            if selected_node is not None or candidate == ("dir", "."):
+                break
+            parent = PurePosixPath(candidate[1]).parent.as_posix()
+            candidate = ("dir", parent if parent not in {"", "."} else ".")
+        if selected_node is None:
+            selected_node = tree.root
+        tree.select_node(selected_node)
+        line = getattr(selected_node, "line", None)
+        if isinstance(line, int):
+            tree.move_cursor_to_line(line, animate=False)
+        tree.scroll_to_node(selected_node)
         self._expanded_dir_relpaths = restored_expanded
 
     def _operations_for_entry(self, relpath: str, action: str) -> list[str]:
@@ -376,11 +414,12 @@ class ReviewApp(ReviewActionsMixin, App[None]):
                 Binding("q", "quit", "Quit"),
                 Binding("question_mark", "show_commands", "Commands"),
                 Binding("h", "toggle_hide_identical", label, show=False),
+                Binding("f", "show_view_filters", "Filters", show=False),
                 Binding("enter", "toggle_cursor_node", "Open/Close"),
                 Binding("o", "open_selected", "Open", show=False),
                 Binding("U", "update_selected_path", "Update Path", show=False),
                 Binding("D", "delete_selected_both", "Delete Both", show=False),
-                Binding("F", "diff_selected", "Diff", show=False),
+                Binding("d", "diff_selected", "Diff", show=False),
                 Binding("P", "copy_selected_path", "Copy Path", show=False),
                 Binding("V", "view_plan", "View Plan", show=False),
                 Binding("C", "clear_plan", "Clear Plan", show=False),
@@ -414,11 +453,11 @@ class ReviewApp(ReviewActionsMixin, App[None]):
             return []
         kind, relpath = selected
         if kind == "file":
-            return [relpath] if relpath in self.files_by_relpath else []
+            return [relpath] if relpath in self.visible_changed_relpaths else []
         return [
             path
             for path in self.dir_files_map.get(relpath, [])
-            if path in self.files_by_relpath
+            if path in self.visible_changed_relpaths
         ]
 
     def _scope_match(
@@ -472,7 +511,7 @@ class ReviewApp(ReviewActionsMixin, App[None]):
         self.action_overrides = load_action_overrides(self.db_path)
 
     def _set_info_for_dir(self, entry: DirEntry) -> None:
-        c = entry.counts
+        c = self.display_counts_by_dir.get(entry.relpath, entry.counts)
         meta_fields = (
             ", ".join(
                 f"{name}:{count}"
@@ -495,6 +534,7 @@ class ReviewApp(ReviewActionsMixin, App[None]):
             f"Identical: {c.identical}",
             "",
             f"Hide identical folders: {'ON' if self.hide_identical else 'OFF'}",
+            f"Filters shown: {len(self.enabled_view_filters)}/{len(ALL_VIEW_FILTERS)}",
             "Actions: ?=commands l=left wins r=right wins i=ignore s=suggested",
         ]
         self.query_one("#info", Static).update("\n".join(lines))

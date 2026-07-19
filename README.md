@@ -69,11 +69,12 @@ uv run limsync review --state-db ~/.limsync/some_pair.sqlite3
 - Arrow keys: navigate tree
 - Enter: open/close selected folder
 - `?`: show advanced Commands modal (`Up/Down` to select, `Enter` to execute), including scoped path update (`U`), clear plan, and metadata-suggestion bulk apply
+- `f`: filter the review tree by copy direction, conflicts, uncertain files, metadata-only drift, or delete candidates
 - `P`: copy selected file/folder relative path to clipboard
 - `V`: view current plan as grouped action tree (copy/metadata/delete categories)
 - `h`: show/hide completely identical folders (preference persisted in SQLite)
 - `D`: delete selected file/folder on both sides (with confirmation)
-- `F`: diff selected file (left vs right) in a modal
+- `d`: diff selected file (left vs right) in a modal
 - `l`: left wins (applies to selected file/subtree)
 - `r`: right wins (applies to selected file/subtree)
 - `i`: ignore (applies to selected file/subtree)
@@ -81,6 +82,14 @@ uv run limsync review --state-db ~/.limsync/some_pair.sqlite3
 - `s`: suggested planner action (applies to selected file/subtree)
 - `a`: apply current plan (press twice to confirm)
 - `q`: quit
+
+### View filters
+
+The filter modal shows the total count for each review category. All six categories
+start enabled for each review session. Use `Space` to toggle a category, `Enter` to
+apply the selection, or `Escape` to cancel. Filters change only the tree view;
+existing plan actions remain intact. Folder actions affect only files visible under
+the active filters.
 
 ## Planner behavior
 - Default action is `ignore` (do nothing) until you assign actions.
@@ -92,6 +101,10 @@ uv run limsync review --state-db ~/.limsync/some_pair.sqlite3
 - Applying opens:
   - confirmation modal (`A` apply / `C` cancel)
   - execution modal with progress bar and error list
+  - a cooperative cancel action that finishes the current operation, preserves
+    completed paths, and leaves unstarted operations in the plan
+- Large metadata-only plans are streamed in batches over SSH instead of issuing
+  per-file SFTP metadata round trips. Only metadata fields that differ are updated.
 - After apply:
   - successful paths are marked done in-place during execution (no rescan)
   - failed paths stay pending in the UI

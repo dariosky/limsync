@@ -5,6 +5,7 @@ from limsync.tree_builder import (
     FolderCounts,
     _file_label,
     _folder_action_counts_by_relpath,
+    _folder_counts_by_relpath,
     _folder_label,
 )
 
@@ -129,6 +130,34 @@ def test_folder_action_counts_roll_up_mixed_files_by_chosen_action() -> None:
     )
 
     assert counts["docs"] == ActionCounts(left=4)
+
+
+def test_filtered_folder_counts_and_actions_include_only_visible_changes() -> None:
+    files_by_relpath = {
+        "docs/left.txt": _mk_file_entry("only_left", relpath="docs/left.txt"),
+        "docs/meta.txt": _mk_file_entry(
+            "identical", "different", relpath="docs/meta.txt"
+        ),
+        "docs/same.txt": _mk_file_entry("identical", relpath="docs/same.txt"),
+    }
+    dir_files_map = {".": list(files_by_relpath), "docs": list(files_by_relpath)}
+    visible = {"docs/left.txt"}
+
+    counts = _folder_counts_by_relpath(
+        dir_files_map, files_by_relpath, included_changed_relpaths=visible
+    )
+    actions = _folder_action_counts_by_relpath(
+        dir_files_map,
+        files_by_relpath,
+        {
+            "docs/left.txt": "left_wins",
+            "docs/meta.txt": "suggested",
+        },
+        included_relpaths=visible,
+    )
+
+    assert counts["docs"] == FolderCounts(only_left=1, identical=1)
+    assert actions["docs"] == ActionCounts(left=1)
 
 
 def test_file_label_uses_readable_badges() -> None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -156,10 +157,22 @@ def test_build_plan_different_unknown_and_metadata_rules() -> None:
     )
     assert both == {
         ("copy_right", "conflict"),
-        ("metadata_update_right", "conflict"),
         ("copy_left", "uncertain"),
-        ("metadata_update_left", "uncertain"),
     }
+
+
+def test_build_plan_metadata_operation_carries_only_changed_fields() -> None:
+    diff = mk_diff(
+        "mode-only",
+        content_state=ContentState.IDENTICAL,
+        metadata_state=MetadataState.DIFFERENT,
+        metadata_diff=("mode",),
+        metadata_source="left",
+    )
+
+    assert build_plan_operations([diff], {"mode-only": ACTION_SUGGESTED}) == [
+        PlanOperation("metadata_update_right", "mode-only", ("mode",))
+    ]
 
 
 def test_summarize_operations_counts() -> None:
@@ -406,6 +419,100 @@ def test_execute_plan_put_uses_confirm_false_by_default(tmp_path, monkeypatch) -
     assert put_calls[0][-1] is False
 
 
+def test_execute_plan_put_replaces_read_only_remote_via_temporary_file(
+    tmp_path, monkeypatch
+) -> None:
+    class ReadOnlyDestinationSFTP(FakeSFTPClient):
+        def put(
+            self, local_path: str, remote_path: str, *, confirm: bool = True
+        ) -> None:
+            if remote_path == "/remote/a.txt":
+                self.calls.append(("put", local_path, remote_path, confirm))
+                raise PermissionError("Permission denied")
+            super().put(local_path, remote_path, confirm=confirm)
+
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    src = local_root / "a.txt"
+    src.write_text("replacement", encoding="utf-8")
+    os.chmod(src, 0o444)
+
+    sftp = ReadOnlyDestinationSFTP()
+    sftp.existing_dirs.add("/remote")
+    sftp.remote_files["/remote/a.txt"] = b"old"
+    sftp.remote_stats["/remote/a.txt"] = make_remote_stat(mode=0o100444)
+    ssh = FakeSSHClient(sftp)
+
+    from limsync import planner_apply as pa
+
+    monkeypatch.setattr(pa.paramiko, "SSHClient", lambda: ssh)
+    monkeypatch.setattr(pa.paramiko, "AutoAddPolicy", DummyAutoAddPolicy)
+    monkeypatch.setattr(pa, "_remote_expand_root", lambda _client, _root: "/remote")
+
+    result = execute_plan(
+        local_root,
+        "u@h:~/x",
+        [PlanOperation("copy_right", "a.txt")],
+    )
+
+    assert result.errors == []
+    assert result.succeeded_operations == 1
+    assert sftp.remote_files["/remote/a.txt"] == b"replacement"
+    assert stat.S_IMODE(sftp.remote_stats["/remote/a.txt"].st_mode) == 0o444
+    put_calls = [call for call in sftp.calls if call[0] == "put"]
+    assert len(put_calls) == 2
+    temporary_path = put_calls[1][2]
+    assert temporary_path.startswith("/remote/.a.txt.limsync-")
+    assert temporary_path.endswith(".tmp")
+    assert temporary_path not in sftp.remote_files
+    assert ("posix_rename", temporary_path, "/remote/a.txt") in sftp.calls
+
+
+def test_execute_plan_put_cleans_temporary_file_when_replace_fails(
+    tmp_path, monkeypatch
+) -> None:
+    class FailedReplacementSFTP(FakeSFTPClient):
+        def put(
+            self, local_path: str, remote_path: str, *, confirm: bool = True
+        ) -> None:
+            if remote_path == "/remote/a.txt":
+                self.calls.append(("put", local_path, remote_path, confirm))
+                raise PermissionError("Permission denied")
+            super().put(local_path, remote_path, confirm=confirm)
+
+        def posix_rename(self, oldpath: str, newpath: str) -> None:
+            self.calls.append(("posix_rename", oldpath, newpath))
+            raise OSError("atomic replace unavailable")
+
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    (local_root / "a.txt").write_text("replacement", encoding="utf-8")
+
+    sftp = FailedReplacementSFTP()
+    sftp.existing_dirs.add("/remote")
+    sftp.remote_files["/remote/a.txt"] = b"old"
+    ssh = FakeSSHClient(sftp)
+
+    from limsync import planner_apply as pa
+
+    monkeypatch.setattr(pa.paramiko, "SSHClient", lambda: ssh)
+    monkeypatch.setattr(pa.paramiko, "AutoAddPolicy", DummyAutoAddPolicy)
+    monkeypatch.setattr(pa, "_remote_expand_root", lambda _client, _root: "/remote")
+
+    result = execute_plan(
+        local_root,
+        "u@h:~/x",
+        [PlanOperation("copy_right", "a.txt")],
+    )
+
+    assert result.succeeded_operations == 0
+    assert len(result.errors) == 1
+    assert "direct upload failed (Permission denied)" in result.errors[0]
+    assert "temporary replacement failed (atomic replace unavailable)" in result.errors[0]
+    assert sftp.remote_files["/remote/a.txt"] == b"old"
+    assert not any(".limsync-" in path for path in sftp.remote_files)
+
+
 def test_execute_plan_connect_respects_ssh_compression(tmp_path, monkeypatch) -> None:
     local_root = tmp_path / "local"
     local_root.mkdir()
@@ -499,6 +606,204 @@ def test_execute_plan_metadata_symlink_is_noop(tmp_path, monkeypatch) -> None:
     assert not any(call[0] == "chmod" for call in sftp.calls)
 
 
+def test_execute_plan_local_metadata_mode_only_preserves_mtime(tmp_path) -> None:
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    (left / "x").write_text("x", encoding="utf-8")
+    (right / "x").write_text("x", encoding="utf-8")
+    os.chmod(left / "x", 0o600)
+    os.chmod(right / "x", 0o777)
+    os.utime(left / "x", ns=(10_000_000_000, 20_000_000_000))
+    os.utime(right / "x", ns=(30_000_000_000, 40_000_000_000))
+
+    result = execute_plan(
+        left,
+        right,
+        [PlanOperation("metadata_update_right", "x", ("mode",))],
+    )
+
+    assert result.errors == []
+    assert stat.S_IMODE((right / "x").stat().st_mode) == 0o600
+    assert (right / "x").stat().st_mtime_ns == 40_000_000_000
+
+
+def test_execute_plan_local_metadata_mtime_only_preserves_mode(tmp_path) -> None:
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    (left / "x").write_text("x", encoding="utf-8")
+    (right / "x").write_text("x", encoding="utf-8")
+    os.chmod(left / "x", 0o600)
+    os.chmod(right / "x", 0o744)
+    os.utime(left / "x", ns=(10_000_000_000, 20_000_000_000))
+    os.utime(right / "x", ns=(30_000_000_000, 40_000_000_000))
+
+    result = execute_plan(
+        left,
+        right,
+        [PlanOperation("metadata_update_right", "x", ("mtime",))],
+    )
+
+    assert result.errors == []
+    assert stat.S_IMODE((right / "x").stat().st_mode) == 0o744
+    assert (right / "x").stat().st_mtime_ns == 20_000_000_000
+
+
+def test_execute_plan_batches_local_to_remote_metadata(tmp_path, monkeypatch) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    for name in ("a", "b"):
+        (local_root / name).write_text(name, encoding="utf-8")
+        os.chmod(local_root / name, 0o600)
+
+    sftp = FakeSFTPClient()
+    ssh = FakeSSHClient(sftp)
+    calls: list[tuple[str, list[dict[str, object]]]] = []
+
+    from limsync import planner_apply as pa
+
+    monkeypatch.setattr(pa.paramiko, "SSHClient", lambda: ssh)
+    monkeypatch.setattr(pa.paramiko, "AutoAddPolicy", DummyAutoAddPolicy)
+    monkeypatch.setattr(pa, "_remote_expand_root", lambda _client, _root: "/remote")
+
+    def fake_helper(remote, mode, requests, response_cb=None, cancel_event=None):
+        _ = cancel_event
+        _ = remote
+        calls.append((mode, requests))
+        responses = {
+            int(request["id"]): {"id": request["id"], "ok": True}
+            for request in requests
+        }
+        if response_cb is not None:
+            for response in responses.values():
+                response_cb(response)
+        return responses, None
+
+    monkeypatch.setattr(pa, "_run_remote_metadata_helper", fake_helper)
+    result = execute_plan(
+        local_root,
+        "u@h:~/x",
+        [
+            PlanOperation("metadata_update_right", "a", ("mode",)),
+            PlanOperation("metadata_update_right", "b", ("mode",)),
+        ],
+    )
+
+    assert result.succeeded_operations == 2
+    assert [mode for mode, _requests in calls] == ["apply"]
+    assert all(request["fields"] == ["mode"] for request in calls[0][1])
+    assert not any(call[0] in {"lstat", "chmod", "utime"} for call in sftp.calls)
+
+
+def test_execute_plan_batches_remote_to_local_metadata(tmp_path, monkeypatch) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    (local_root / "x").write_text("x", encoding="utf-8")
+    os.chmod(local_root / "x", 0o777)
+
+    sftp = FakeSFTPClient()
+    ssh = FakeSSHClient(sftp)
+
+    from limsync import planner_apply as pa
+
+    monkeypatch.setattr(pa.paramiko, "SSHClient", lambda: ssh)
+    monkeypatch.setattr(pa.paramiko, "AutoAddPolicy", DummyAutoAddPolicy)
+    monkeypatch.setattr(pa, "_remote_expand_root", lambda _client, _root: "/remote")
+
+    def fake_helper(remote, mode, requests, response_cb=None, cancel_event=None):
+        _ = (remote, response_cb, cancel_event)
+        assert mode == "read"
+        return {0: {"id": 0, "ok": True, "mode": 0o640}}, None
+
+    monkeypatch.setattr(pa, "_run_remote_metadata_helper", fake_helper)
+    result = execute_plan(
+        "u@h:~/x",
+        local_root,
+        [PlanOperation("metadata_update_right", "x", ("mode",))],
+    )
+
+    assert result.errors == []
+    assert stat.S_IMODE((local_root / "x").stat().st_mode) == 0o640
+
+
+def test_execute_plan_batches_remote_to_remote_metadata(tmp_path, monkeypatch) -> None:
+    _ = tmp_path
+    sftp = FakeSFTPClient()
+    ssh = FakeSSHClient(sftp)
+    calls: list[tuple[str, str]] = []
+
+    from limsync import planner_apply as pa
+
+    monkeypatch.setattr(pa.paramiko, "SSHClient", lambda: ssh)
+    monkeypatch.setattr(pa.paramiko, "AutoAddPolicy", DummyAutoAddPolicy)
+    monkeypatch.setattr(pa, "_remote_expand_root", lambda _client, _root: "/remote")
+
+    def fake_helper(remote, mode, requests, response_cb=None, cancel_event=None):
+        _ = cancel_event
+        calls.append((remote.host, mode))
+        if mode == "read":
+            return {0: {"id": 0, "ok": True, "mode": 0o600}}, None
+        response = {"id": requests[0]["id"], "ok": True}
+        assert requests[0]["mode"] == 0o600
+        assert response_cb is not None
+        response_cb(response)
+        return {0: response}, None
+
+    monkeypatch.setattr(pa, "_run_remote_metadata_helper", fake_helper)
+    result = execute_plan(
+        "u@source:~/x",
+        "u@destination:~/x",
+        [PlanOperation("metadata_update_right", "x", ("mode",))],
+    )
+
+    assert result.errors == []
+    assert calls == [("source", "read"), ("destination", "apply")]
+
+
+def test_execute_plan_batch_keeps_per_path_remote_errors(tmp_path, monkeypatch) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    for name in ("ok", "bad"):
+        (local_root / name).write_text(name, encoding="utf-8")
+
+    sftp = FakeSFTPClient()
+    ssh = FakeSSHClient(sftp)
+
+    from limsync import planner_apply as pa
+
+    monkeypatch.setattr(pa.paramiko, "SSHClient", lambda: ssh)
+    monkeypatch.setattr(pa.paramiko, "AutoAddPolicy", DummyAutoAddPolicy)
+    monkeypatch.setattr(pa, "_remote_expand_root", lambda _client, _root: "/remote")
+
+    def fake_helper(remote, mode, requests, response_cb=None, cancel_event=None):
+        _ = (remote, mode, cancel_event)
+        assert response_cb is not None
+        responses = {
+            0: {"id": requests[0]["id"], "ok": True},
+            1: {"id": requests[1]["id"], "ok": False, "error": "denied"},
+        }
+        for response in responses.values():
+            response_cb(response)
+        return responses, None
+
+    monkeypatch.setattr(pa, "_run_remote_metadata_helper", fake_helper)
+    result = execute_plan(
+        local_root,
+        "u@h:~/x",
+        [
+            PlanOperation("metadata_update_right", "ok", ("mode",)),
+            PlanOperation("metadata_update_right", "bad", ("mode",)),
+        ],
+    )
+
+    assert result.succeeded_operations == 1
+    assert result.completed_paths == {"ok"}
+    assert result.errors == ["metadata_update_right bad: denied"]
+
+
 def test_execute_plan_partial_failures_and_completed_paths(tmp_path, monkeypatch) -> None:
     local_root = tmp_path / "local"
     local_root.mkdir()
@@ -527,6 +832,136 @@ def test_execute_plan_partial_failures_and_completed_paths(tmp_path, monkeypatch
     assert result.errors[0].startswith("delete_left missing.txt:")
     assert result.completed_paths == {"ok.txt"}
     assert ("copy_right", "ok.txt") in result.succeeded_operation_keys
+
+
+def test_execute_plan_cancelled_before_start_does_not_connect(tmp_path, monkeypatch) -> None:
+    class BoomClient:
+        def __init__(self):
+            raise AssertionError("SSH should not be created after cancellation")
+
+    from limsync import planner_apply as pa
+
+    monkeypatch.setattr(pa.paramiko, "SSHClient", BoomClient)
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    result = execute_plan(
+        tmp_path,
+        "u@h:/r",
+        [PlanOperation("copy_right", "x")],
+        cancel_event=cancel_event,
+    )
+
+    assert result.cancelled is True
+    assert result.succeeded_operations == 0
+    assert result.total_operations == 1
+
+
+def test_execute_plan_finishes_active_copy_then_stops(tmp_path, monkeypatch) -> None:
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    (left / "a").write_text("a", encoding="utf-8")
+    (left / "b").write_text("b", encoding="utf-8")
+    cancel_event = threading.Event()
+
+    from limsync import planner_apply as pa
+
+    original_copy = pa._copy_between
+
+    def cancelling_copy(*args, **kwargs):
+        cancel_event.set()
+        return original_copy(*args, **kwargs)
+
+    monkeypatch.setattr(pa, "_copy_between", cancelling_copy)
+    result = execute_plan(
+        left,
+        right,
+        [PlanOperation("copy_right", "a"), PlanOperation("copy_right", "b")],
+        cancel_event=cancel_event,
+    )
+
+    assert result.cancelled is True
+    assert result.completed_paths == {"a"}
+    assert (right / "a").read_text(encoding="utf-8") == "a"
+    assert not (right / "b").exists()
+
+
+def test_execute_plan_cancel_stops_local_metadata_before_next_path(tmp_path) -> None:
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    for name in ("a", "b"):
+        (left / name).write_text(name, encoding="utf-8")
+        (right / name).write_text(name, encoding="utf-8")
+        os.chmod(left / name, 0o600)
+        os.chmod(right / name, 0o777)
+    cancel_event = threading.Event()
+
+    def progress(done, total, op, ok, error):
+        _ = (total, op, ok, error)
+        if done == 1:
+            cancel_event.set()
+
+    result = execute_plan(
+        left,
+        right,
+        [
+            PlanOperation("metadata_update_right", "a", ("mode",)),
+            PlanOperation("metadata_update_right", "b", ("mode",)),
+        ],
+        progress_cb=progress,
+        cancel_event=cancel_event,
+    )
+
+    assert result.cancelled is True
+    assert result.completed_paths == {"a"}
+    assert stat.S_IMODE((right / "a").stat().st_mode) == 0o600
+    assert stat.S_IMODE((right / "b").stat().st_mode) == 0o777
+
+
+def test_execute_plan_cancel_stops_remote_metadata_without_errors(
+    tmp_path, monkeypatch
+) -> None:
+    local_root = tmp_path / "local"
+    local_root.mkdir()
+    for name in ("a", "b"):
+        (local_root / name).write_text(name, encoding="utf-8")
+
+    sftp = FakeSFTPClient()
+    ssh = FakeSSHClient(sftp)
+    cancel_event = threading.Event()
+
+    from limsync import planner_apply as pa
+
+    monkeypatch.setattr(pa.paramiko, "SSHClient", lambda: ssh)
+    monkeypatch.setattr(pa.paramiko, "AutoAddPolicy", DummyAutoAddPolicy)
+    monkeypatch.setattr(pa, "_remote_expand_root", lambda _client, _root: "/remote")
+
+    def fake_helper(remote, mode, requests, response_cb=None, cancel_event=None):
+        _ = (remote, mode)
+        assert response_cb is not None
+        assert cancel_event is not None
+        response_cb({"id": requests[0]["id"], "ok": True})
+        cancel_event.set()
+        return {}, None
+
+    monkeypatch.setattr(pa, "_run_remote_metadata_helper", fake_helper)
+    result = execute_plan(
+        local_root,
+        "u@h:~/x",
+        [
+            PlanOperation("metadata_update_right", "a", ("mode",)),
+            PlanOperation("metadata_update_right", "b", ("mode",)),
+        ],
+        cancel_event=cancel_event,
+    )
+
+    assert result.cancelled is True
+    assert result.completed_paths == {"a"}
+    assert result.errors == []
 
 
 def test_remote_expand_root_success_and_error() -> None:
