@@ -151,8 +151,8 @@ def _run_scan(
                 records = RemoteScanner(
                     RemoteConfig(
                         host=str(endpoint.host),
-                        user=str(endpoint.user),
-                        port=endpoint.port or 22,
+                        user=endpoint.user,
+                        port=endpoint.port,
                         root=endpoint.root,
                         state_db=default_endpoint_state_db(endpoint),
                     )

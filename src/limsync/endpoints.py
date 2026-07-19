@@ -8,7 +8,9 @@ from urllib.parse import urlparse
 
 from .config import DEFAULT_REMOTE_PORT, DEFAULT_STATE_SUBPATH
 
-_LEGACY_REMOTE_RE = re.compile(r"^[^@\s]+@[^:\s]+:.+")
+_SCP_REMOTE_RE = re.compile(
+    r"^(?:(?P<user>[^@:/\s]+)@)?(?P<host>[^:/\s]+):(?P<root>.+)$"
+)
 
 
 @dataclass(frozen=True)
@@ -34,7 +36,8 @@ class EndpointSpec:
         port_part = ""
         if self.port is not None and self.port != DEFAULT_REMOTE_PORT:
             port_part = f":{self.port}"
-        return f"{self.user}@{self.host}{port_part}:{self.root}"
+        user_part = f"{self.user}@" if self.user else ""
+        return f"{user_part}{self.host}{port_part}:{self.root}"
 
 
 @dataclass(frozen=True)
@@ -59,7 +62,7 @@ def parse_endpoint(value: str) -> EndpointSpec:
 
     if text.startswith("ssh://"):
         parsed = urlparse(text)
-        if parsed.scheme != "ssh" or not parsed.hostname or not parsed.username:
+        if parsed.scheme != "ssh" or not parsed.hostname:
             raise ValueError(f"invalid ssh endpoint: {value}")
         root = parsed.path or "/"
         if root.startswith("/~/"):
@@ -74,18 +77,17 @@ def parse_endpoint(value: str) -> EndpointSpec:
             root=root,
             user=parsed.username,
             host=parsed.hostname,
-            port=parsed.port or DEFAULT_REMOTE_PORT,
+            port=parsed.port,
         )
 
-    if _LEGACY_REMOTE_RE.match(text):
-        user_host, root = text.split(":", 1)
-        user, host = user_host.split("@", 1)
+    scp_match = _SCP_REMOTE_RE.match(text)
+    if scp_match is not None:
         return EndpointSpec(
             kind="remote",
-            root=root,
-            user=user,
-            host=host,
-            port=DEFAULT_REMOTE_PORT,
+            root=scp_match.group("root"),
+            user=scp_match.group("user"),
+            host=scp_match.group("host"),
+            port=None,
         )
 
     root = str(Path(text).expanduser().resolve())
@@ -95,8 +97,18 @@ def parse_endpoint(value: str) -> EndpointSpec:
 def endpoint_to_string(endpoint: EndpointSpec) -> str:
     if endpoint.is_local:
         return f"local:{endpoint.root}"
-    port = endpoint.port or DEFAULT_REMOTE_PORT
-    return f"ssh://{endpoint.user}@{endpoint.host}:{port}{endpoint.root}"
+    user_part = f"{endpoint.user}@" if endpoint.user else ""
+    port_part = f":{endpoint.port}" if endpoint.port is not None else ""
+    root = endpoint.root
+    if root == "~":
+        path = "/~"
+    elif root.startswith("~/"):
+        path = f"/{root}"
+    elif root.startswith("/"):
+        path = root
+    else:
+        path = f"/{root}"
+    return f"ssh://{user_part}{endpoint.host}{port_part}{path}"
 
 
 def default_endpoint_state_db(endpoint: EndpointSpec) -> str:

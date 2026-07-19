@@ -32,6 +32,7 @@ uv sync
 ```bash
 uv run limsync --help
 uv run limsync --source local:/path/to/source --destination user@host:/path/to/destination
+uv run limsync --source ~/Dropbox --destination host-alias:~/Dropbox
 uv run limsync review --source local:/path/to/source --destination user@host:/path/to/destination
 ```
 

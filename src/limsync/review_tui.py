@@ -592,8 +592,8 @@ class ReviewApp(ReviewActionsMixin, App[None]):
         return RemoteScanner(
             RemoteConfig(
                 host=str(endpoint.host),
-                user=str(endpoint.user),
-                port=endpoint.port or 22,
+                user=endpoint.user,
+                port=endpoint.port,
                 root=endpoint.root,
                 state_db=default_endpoint_state_db(endpoint),
             )
@@ -621,8 +621,8 @@ class ReviewApp(ReviewActionsMixin, App[None]):
 
         with pooled_ssh_client(
             host=str(endpoint.host),
-            user=str(endpoint.user),
-            port=endpoint.port or 22,
+            user=endpoint.user,
+            port=endpoint.port,
             compress=self.apply_settings.ssh_compression,
             timeout=10,
         ) as client:

@@ -237,8 +237,8 @@ class ReviewActionsMixin:
 
             with pooled_ssh_client(
                 host=str(endpoint.host),
-                user=str(endpoint.user),
-                port=endpoint.port or 22,
+                user=endpoint.user,
+                port=endpoint.port,
                 compress=self.apply_settings.ssh_compression,
                 timeout=10,
             ) as client:
@@ -284,8 +284,8 @@ class ReviewActionsMixin:
             endpoint = self.source_endpoint
             with pooled_ssh_client(
                 host=str(endpoint.host),
-                user=str(endpoint.user),
-                port=endpoint.port or 22,
+                user=endpoint.user,
+                port=endpoint.port,
                 compress=self.apply_settings.ssh_compression,
                 timeout=10,
             ) as client:

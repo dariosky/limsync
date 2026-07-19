@@ -383,8 +383,8 @@ def _remote_runtime(
     client = stack.enter_context(
         pooled_ssh_client(
             host=str(endpoint.host),
-            user=str(endpoint.user),
-            port=endpoint.port or DEFAULT_REMOTE_PORT,
+            user=endpoint.user,
+            port=endpoint.port,
             compress=compress,
             timeout=10,
             client_factory=paramiko.SSHClient,
@@ -403,7 +403,7 @@ def _remote_runtime(
         sftp=sftp,
         root=root,
         home=home,
-        user=str(endpoint.user),
+        user=endpoint.user or "",
         host=str(endpoint.host),
         port=endpoint.port or DEFAULT_REMOTE_PORT,
     )
